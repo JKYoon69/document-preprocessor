@@ -23,7 +23,6 @@ if uploaded_file is not None:
         with st.status("분석을 시작합니다...", expanded=True) as status:
             try:
                 api_key = st.secrets["GEMINI_API_KEY"]
-                # ✅✅✅ 호출하는 함수 이름을 정확히 일치시킴 ✅✅✅
                 final_result, stats, debug_info = document_processor.run_extraction_pipeline(
                     document_text=document_text, 
                     api_key=api_key,

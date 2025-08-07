@@ -6,7 +6,6 @@ import traceback
 from collections import Counter
 import time
 
-# 헬퍼 함수: LLM 응답에서 JSON 추출
 def extract_json_from_response(text):
     if '```json' in text:
         try:
@@ -18,7 +17,6 @@ def extract_json_from_response(text):
     except json.JSONDecodeError:
         return None
 
-# 헬퍼 함수: 의미 기반 청킹
 def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
     if len(text) <= chunk_size_chars:
         return [{"start_char": 0, "end_char": len(text), "text": text, "global_start": 0}]
@@ -48,7 +46,6 @@ def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
         start_char = actual_end - overlap_chars
     return chunks
 
-# 구조 추출에 집중하는 파이프라인
 def run_extraction_pipeline(document_text, api_key, status_container):
     model_name = 'gemini-2.5-flash-lite'
     genai.configure(api_key=api_key)
@@ -59,7 +56,6 @@ def run_extraction_pipeline(document_text, api_key, status_container):
     chunk_stats = []
     global_summary = ""
 
-    # 1. 전역 요약 생성
     status_container.write("1/3: 문서 전역 요약 생성 중...")
     try:
         preamble = document_text[:4000]
@@ -70,7 +66,6 @@ def run_extraction_pipeline(document_text, api_key, status_container):
         global_summary = f"전역 요약 생성 중 오류 발생: {e}"
         debug_info.append({"global_summary_error": traceback.format_exc()})
 
-    # 2. 청크 분할 및 구조 분석
     status_container.write("2/3: 문서를 청킹하고 구조 분석 실행 중...")
     chunks = chunk_text_semantic(document_text)
     
@@ -80,7 +75,7 @@ Follow these rules with extreme precision:
 1.  Identify the introductory text before the first formal article as `preamble`.
 2.  Identify all headers such as 'ภาค', 'ลักษณะ', 'หมวด', 'ส่วน', and 'มาตรา'.
 3.  For each element, create a JSON object.
-4.  The `title` field MUST contain ONLY the short header text (e.g., "มาตรา ๑").
+4.  The `title` field MUST contain ONLY the short header text (e.g., "มาตรา ๑"), NOT the full text of the article.
 5.  The `end_index` of an element MUST extend to the character right before the `start_index` of the NEXT element. If it is the last element in the chunk, its `end_index` is the end of the chunk. This is crucial to avoid missing any text.
 6.  Map the Thai header to the `type` field using these exact rules:
     - Text before 'มาตรา ๑' -> 'preamble'
@@ -139,7 +134,6 @@ Example of expected output for a chunk:
             debug_info.append({f"chunk_{chunk_num}_critical_error": traceback.format_exc()})
             continue
 
-    # 3. 결과 통합
     status_container.write("3/3: 결과 통합 및 중복 제거 중...")
     
     if not all_headers:
