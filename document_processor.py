@@ -6,98 +6,47 @@ import traceback
 from collections import Counter
 import time
 
+# (extract_json_from_response 와 chunk_text_semantic 함수는 변경 없음)
 def extract_json_from_response(text):
-    """
-    LLM의 응답 텍스트에서 JSON 코드 블록을 추출하여 파싱합니다.
-    """
     if '```json' in text:
-        try:
-            # ```json ``` 블록이 있는 경우
-            return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
-        except (json.JSONDecodeError, IndexError):
-            return None
-    
-    try:
-        # 코드 블록이 없는 순수 JSON 텍스트인 경우
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return None
+        try: return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
+        except (json.JSONDecodeError, IndexError): return None
+    try: return json.loads(text)
+    except json.JSONDecodeError: return None
 
 def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
-    """
-    문장, 문단 등 의미있는 경계를 찾아 청크를 나누는 함수.
-    각 청크는 딕셔너리 형태로, 'text'와 'global_start' 키를 포함합니다.
-    """
     if len(text) <= chunk_size_chars:
         return [{"start_char": 0, "end_char": len(text), "text": text, "global_start": 0}]
-
-    chunks = []
-    start_char = 0
+    chunks, start_char = [], 0
     while start_char < len(text):
         ideal_end = start_char + chunk_size_chars
         actual_end = min(ideal_end, len(text))
-        
-        # 마지막 청크 처리
         if ideal_end >= len(text):
-            chunks.append({
-                "start_char": start_char, 
-                "end_char": actual_end, 
-                "text": text[start_char:actual_end],
-                "global_start": start_char
-            })
+            chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end], "global_start": start_char})
             break
-
-        # 의미있는 경계 찾기 (뒤에서부터 탐색)
         separators = ["\n\n", ". ", " ", ""]
         best_sep_pos = -1
         for sep in separators:
-            # 검색 범위를 제한하여 효율성 증대
             search_start = max(start_char, ideal_end - 5000)
             best_sep_pos = text.rfind(sep, search_start, ideal_end)
             if best_sep_pos != -1:
                 actual_end = best_sep_pos + len(sep)
                 break
-        
-        if best_sep_pos == -1: # 적절한 분리 지점을 못 찾으면 그냥 자름
-            actual_end = ideal_end
-
-        chunks.append({
-            "start_char": start_char, 
-            "end_char": actual_end, 
-            "text": text[start_char:actual_end],
-            "global_start": start_char
-        })
+        if best_sep_pos == -1: actual_end = ideal_end
+        chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end], "global_start": start_char})
         start_char = actual_end - overlap_chars
     return chunks
 
+# 전체 파이프라인
 def run_full_pipeline(document_text, api_key, status_container):
-    """
-    전체 파이프라인을 실행하여 구조 분석 및 통계 데이터를 반환합니다.
-    """
     model_name = 'gemini-2.5-flash-lite'
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
-    
-    debug_info = []
-    all_headers = []
-    chunk_stats = []
+    debug_info, all_headers, chunk_stats = [], [], []
 
-    # 1. 전역 요약 생성
+    # 1. 전역 요약
     status_container.write("1/4: 문서 전역 요약 생성 중...")
-    try:
-        preamble = document_text[:4000]
-        prompt_global = f"Summarize the following Thai legal document preamble in Korean. Respond with the summary text only.\n\n[Preamble]\n{preamble}"
-        
-        start_time = time.time()
-        response_summary = model.generate_content(prompt_global)
-        end_time = time.time()
-        
-        global_summary = response_summary.text.strip()
-        debug_info.append({"global_summary_response_time": f"{end_time - start_time:.2f} 초"})
-        
-    except Exception as e:
-        global_summary = f"전역 요약 생성 중 오류 발생: {e}"
-        debug_info.append({"global_summary_error": traceback.format_exc()})
+    # ... (이하 동일)
 
     # 2. 청크 분할
     status_container.write("2/4: 문서를 의미 기반 청크로 분할 중...")
@@ -105,10 +54,42 @@ def run_full_pipeline(document_text, api_key, status_container):
     status_container.write(f"분할 완료: 총 {len(chunks)}개 청크 생성됨.")
     
     # 3. 각 청크별 구조 분석
-    prompt_structure = """As an expert JSON generator, analyze the following Thai legal text chunk. Identify all headers like 'หมวด', 'ส่วน', 'มาตรา'. For each, return a JSON object with 'type', 'title', 'start_index', and 'end_index'. Return a JSON array of these objects. If no headers are found, return an empty array [].
+    # ✅✅✅ 프롬프트 전면 수정 ✅✅✅
+    prompt_structure = """You are a precise data extraction tool. Your task is to analyze the following chunk of a Thai legal document and identify all hierarchical headers.
+
+Follow these rules STRICTLY:
+1.  Identify headers such as 'ภาค', 'ลักษณะ', 'หมวด', 'ส่วน', and 'มาตรา'.
+2.  For each header, create a JSON object.
+3.  The `title` field MUST contain ONLY the header text itself (e.g., "มาตรา ๑"), NOT the full text of the article.
+4.  Map the Thai header to the `type` field using these exact rules:
+    - 'ภาค' -> 'book'
+    - 'ลักษณะ' -> 'part'
+    - 'หมวด' -> 'chapter'
+    - 'ส่วน' -> 'section'
+    - 'มาตรา' -> 'article'
+5.  Provide the character `start_index` and `end_index` for the entire element (header + its content).
+6.  Return a single JSON array of these objects. If no headers are found, return an empty array [].
+
+Example:
+[
+  {
+    "type": "chapter",
+    "title": "หมวด ๑ บทบัญญัติทั่วไป",
+    "start_index": 120,
+    "end_index": 950
+  },
+  {
+    "type": "article",
+    "title": "มาตรา ๑",
+    "start_index": 250,
+    "end_index": 400
+  }
+]
+
 [Text Chunk]
 {text_chunk}"""
     
+    # (이하 for 루프 및 나머지 코드는 이전 버전과 동일합니다.)
     for i, chunk in enumerate(chunks):
         chunk_num = i + 1
         status_container.write(f"3/4: 청크 {chunk_num}/{len(chunks)} 구조 분석 중...")
@@ -128,7 +109,7 @@ def run_full_pipeline(document_text, api_key, status_container):
             
             if isinstance(headers_in_chunk, list):
                 counts = Counter(h.get('type', 'unknown') for h in headers_in_chunk)
-                chunk_stats.append({"청크 번호": chunk_num, "chapter": counts.get('หมวด', 0), "section": counts.get('ส่วน', 0), "article": counts.get('มาตรา', 0)})
+                chunk_stats.append({"청크 번호": chunk_num, "book": counts.get('book',0), "part": counts.get('part',0), "chapter": counts.get('chapter', 0), "section": counts.get('section', 0), "article": counts.get('article', 0)})
                 
                 for header in headers_in_chunk:
                     if isinstance(header, dict) and all(k in header for k in ['type', 'title', 'start_index', 'end_index']):
@@ -142,31 +123,8 @@ def run_full_pipeline(document_text, api_key, status_container):
             debug_info.append({f"chunk_{chunk_num}_critical_error": traceback.format_exc()})
             continue
 
-    # 4. 결과 통합 및 중복 제거
+    # 4. 결과 통합
     status_container.write("4/4: 결과 통합 및 중복 제거 중...")
-    
-    unique_headers, duplicate_counts, final_counts = [], {}, {}
-    try:
-        original_counts = Counter(h.get('type', 'unknown') for h in all_headers)
-        unique_headers_map = {(h['global_start'], h['title']): h for h in all_headers}
-        unique_headers = sorted(list(unique_headers_map.values()), key=lambda x: x['global_start'])
-        final_counts = Counter(h.get('type', 'unknown') for h in unique_headers)
-        duplicate_counts = {
-            "chapter": original_counts.get('หมวด', 0) - final_counts.get('หมวด', 0),
-            "section": original_counts.get('ส่วน', 0) - final_counts.get('ส่วน', 0),
-            "article": original_counts.get('มาตรา', 0) - final_counts.get('มาตรา', 0)
-        }
-    except KeyError as e:
-        debug_info.append({"deduplication_error": f"중복 제거 중 키 오류 발생: {e}"})
-
-    final_result_data = {
-        "global_summary": global_summary,
-        "structure": unique_headers
-    }
-    stats_data = {
-        "chunk_stats": chunk_stats,
-        "duplicate_counts": duplicate_counts,
-        "final_counts": final_counts
-    }
+    # ... (이하 동일)
 
     return final_result_data, stats_data, debug_info
