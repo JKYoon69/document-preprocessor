@@ -20,7 +20,6 @@ if uploaded_file is not None:
             final_result_data, stats_data, debug_info = {}, {}, []
             try:
                 api_key = st.secrets["GEMINI_API_KEY"]
-                # 파이프라인 실행 후 세 종류의 결과를 받음
                 final_result_data, stats_data, debug_info = document_processor.run_full_pipeline(
                     document_text=document_text, 
                     api_key=api_key,
@@ -28,47 +27,43 @@ if uploaded_file is not None:
                 )
                 status.update(label="✅ 분석 완료!", state="complete", expanded=False)
                 st.success("🎉 모든 작업이 성공적으로 완료되었습니다!")
-
             except Exception as e:
                 status.update(label="치명적 오류 발생", state="error", expanded=True)
                 st.error(f"처리 중 예상치 못한 오류가 발생했습니다: {e}")
             
             # --- 결과 표시 ---
             st.subheader("📊 분석 통계 요약")
-
-            # 1. 청크별 분석 결과
+            # (통계 표시 코드는 이전과 동일)
             with st.expander("1. 청크별 상세 분석 결과 보기"):
-                if stats_data.get("chunk_stats"):
-                    df_chunk = pd.DataFrame(stats_data["chunk_stats"])
-                    st.table(df_chunk.set_index("청크 번호"))
-                else:
-                    st.write("청크 분석 결과가 없습니다.")
-            
-            # 2. 중복 및 최종 결과 요약
+                if stats_data.get("chunk_stats"): st.table(pd.DataFrame(stats_data["chunk_stats"]).set_index("청크 번호"))
+                else: st.write("청크 분석 결과가 없습니다.")
             col1, col2 = st.columns(2)
             with col1:
-                st.write("**중복 발견 항목**")
-                dup_counts = stats_data.get("duplicate_counts", {})
-                st.metric(label="Chapters (หมวด)", value=dup_counts.get("chapter", 0))
-                st.metric(label="Sections (ส่วน)", value=dup_counts.get("section", 0))
-                st.metric(label="Articles (มาตรา)", value=dup_counts.get("article", 0))
-            
+                st.write("**중복 발견 항목**"); dup_counts = stats_data.get("duplicate_counts", {})
+                st.metric("Chapters", dup_counts.get("chapter", 0)); st.metric("Sections", dup_counts.get("section", 0)); st.metric("Articles", dup_counts.get("article", 0))
             with col2:
-                st.write("**최종 항목 (고유)**")
-                final_counts = stats_data.get("final_counts", {})
-                st.metric(label="Chapters (หมวด)", value=final_counts.get("chapter", 0))
-                st.metric(label="Sections (ส่วน)", value=final_counts.get("section", 0))
-                st.metric(label="Articles (มาตรา)", value=final_counts.get("article", 0))
+                st.write("**최종 항목 (고유)**"); final_counts = stats_data.get("final_counts", {})
+                st.metric("Chapters", final_counts.get("chapter", 0)); st.metric("Sections", final_counts.get("section", 0)); st.metric("Articles", final_counts.get("article", 0))
 
-            # 최종 결과 다운로드 버튼
-            st.download_button(
-               label="📋 최종 구조 분석 결과(JSON) 다운로드",
-               data=json.dumps(final_result_data, indent=2, ensure_ascii=False),
-               file_name=f"{uploaded_file.name.split('.')[0]}_structure.json",
-               mime="application/json",
-            )
-            
-            # 디버깅 정보를 항상 맨 아래에 표시
-            st.subheader("🔍 디버깅 정보")
-            st.warning("이 섹션은 문제 해결을 위해 LLM의 원본 응답을 그대로 보여줍니다.")
-            st.json({"llm_responses": debug_info})
+            # --- 다운로드 버튼들 ---
+            st.subheader("📋 결과 다운로드")
+            col1_dl, col2_dl = st.columns(2)
+            with col1_dl:
+                st.download_button(
+                   label="✔️ 최종 결과(JSON) 다운로드",
+                   data=json.dumps(final_result_data, indent=2, ensure_ascii=False),
+                   file_name=f"{uploaded_file.name.split('.')[0]}_structure.json",
+                   mime="application/json",
+                )
+            with col2_dl:
+                # ✅✅✅ 디버그 정보 다운로드 버튼 ✅✅✅
+                st.download_button(
+                   label="🐞 디버그 로그(JSON) 다운로드",
+                   data=json.dumps(debug_info, indent=2, ensure_ascii=False),
+                   file_name=f"{uploaded_file.name.split('.')[0]}_debug.json",
+                   mime="application/json",
+                )
+
+            # 디버깅 정보를 화면에도 간략히 표시
+            with st.expander("🔍 디버깅 정보 미리보기"):
+                st.json({"llm_responses": debug_info})
