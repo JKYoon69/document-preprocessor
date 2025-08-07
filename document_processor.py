@@ -6,14 +6,19 @@ import traceback
 from collections import Counter
 import time
 
-# (extract_json_from_response 와 chunk_text_semantic 함수는 변경 없음)
+# 헬퍼 함수: LLM 응답에서 JSON 추출
 def extract_json_from_response(text):
     if '```json' in text:
-        try: return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
-        except (json.JSONDecodeError, IndexError): return None
-    try: return json.loads(text)
-    except json.JSONDecodeError: return None
+        try:
+            return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
+        except (json.JSONDecodeError, IndexError):
+            return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
 
+# 헬퍼 함수: 의미 기반 청킹
 def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
     if len(text) <= chunk_size_chars:
         return [{"start_char": 0, "end_char": len(text), "text": text, "global_start": 0}]
@@ -32,7 +37,8 @@ def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
             if best_sep_pos != -1:
                 actual_end = best_sep_pos + len(sep)
                 break
-        if best_sep_pos == -1: actual_end = ideal_end
+        if best_sep_pos == -1:
+            actual_end = ideal_end
         chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end], "global_start": start_char})
         start_char = actual_end - overlap_chars
     return chunks
@@ -46,7 +52,14 @@ def run_full_pipeline(document_text, api_key, status_container):
 
     # 1. 전역 요약
     status_container.write("1/4: 문서 전역 요약 생성 중...")
-    # ... (이하 동일)
+    try:
+        preamble = document_text[:4000]
+        prompt_global = f"Summarize the following Thai legal document preamble in Korean. Respond with the summary text only.\n\n[Preamble]\n{preamble}"
+        response_summary = model.generate_content(prompt_global)
+        global_summary = response_summary.text.strip()
+    except Exception as e:
+        global_summary = f"전역 요약 생성 중 오류 발생: {e}"
+        debug_info.append({"global_summary_error": traceback.format_exc()})
 
     # 2. 청크 분할
     status_container.write("2/4: 문서를 의미 기반 청크로 분할 중...")
@@ -54,7 +67,7 @@ def run_full_pipeline(document_text, api_key, status_container):
     status_container.write(f"분할 완료: 총 {len(chunks)}개 청크 생성됨.")
     
     # 3. 각 청크별 구조 분석
-    # ✅✅✅ 프롬프트 전면 수정 ✅✅✅
+    # ✅✅✅ 프롬프트의 예시 JSON 중괄호를 {{ 와 }} 로 수정 ✅✅✅
     prompt_structure = """You are a precise data extraction tool. Your task is to analyze the following chunk of a Thai legal document and identify all hierarchical headers.
 
 Follow these rules STRICTLY:
@@ -72,39 +85,30 @@ Follow these rules STRICTLY:
 
 Example:
 [
-  {
+  {{
     "type": "chapter",
     "title": "หมวด ๑ บทบัญญัติทั่วไป",
     "start_index": 120,
     "end_index": 950
-  },
-  {
+  }},
+  {{
     "type": "article",
     "title": "มาตรา ๑",
     "start_index": 250,
     "end_index": 400
-  }
+  }}
 ]
 
 [Text Chunk]
 {text_chunk}"""
     
-    # (이하 for 루프 및 나머지 코드는 이전 버전과 동일합니다.)
     for i, chunk in enumerate(chunks):
         chunk_num = i + 1
         status_container.write(f"3/4: 청크 {chunk_num}/{len(chunks)} 구조 분석 중...")
         try:
             prompt = prompt_structure.format(text_chunk=chunk["text"])
-            
-            start_time = time.time()
             response = model.generate_content(prompt)
-            end_time = time.time()
-            
-            debug_info.append({
-                f"chunk_{chunk_num}_response_time": f"{end_time - start_time:.2f} 초",
-                f"chunk_{chunk_num}_response": response.text
-            })
-
+            debug_info.append({f"chunk_{chunk_num}_response": response.text})
             headers_in_chunk = extract_json_from_response(response.text)
             
             if isinstance(headers_in_chunk, list):
@@ -125,6 +129,16 @@ Example:
 
     # 4. 결과 통합
     status_container.write("4/4: 결과 통합 및 중복 제거 중...")
-    # ... (이하 동일)
+    unique_headers, duplicate_counts, final_counts = [], {}, {}
+    try:
+        original_counts = Counter(h.get('type', 'unknown') for h in all_headers)
+        unique_headers_map = {(h['global_start'], h['title']): h for h in all_headers}
+        unique_headers = sorted(list(unique_headers_map.values()), key=lambda x: x['global_start'])
+        final_counts = Counter(h.get('type', 'unknown') for h in unique_headers)
+        duplicate_counts = {"chapter": original_counts.get('chapter', 0) - final_counts.get('chapter', 0), "section": original_counts.get('section', 0) - final_counts.get('section', 0), "article": original_counts.get('article', 0) - final_counts.get('article', 0)}
+    except KeyError as e:
+        debug_info.append({"deduplication_error": f"중복 제거 중 키 오류 발생: {e}"})
 
+    final_result_data = {"global_summary": global_summary, "structure": unique_headers}
+    stats_data = {"chunk_stats": chunk_stats, "duplicate_counts": duplicate_counts, "final_counts": final_counts}
     return final_result_data, stats_data, debug_info
