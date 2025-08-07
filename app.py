@@ -1,4 +1,4 @@
-# app.py (디버깅 강화 최종 버전)
+# app.py
 
 import streamlit as st
 import document_processor
@@ -35,13 +35,30 @@ if uploaded_file is not None:
             
             # --- 결과 표시 ---
             st.subheader("📊 분석 통계 요약")
-            # (통계 표시 코드는 이전과 동일)
-            # ...
 
-            # ✅✅✅ 디버깅 정보를 항상 맨 아래에 표시 ✅✅✅
-            st.subheader("🔍 디버깅 정보")
-            st.warning("이 섹션은 문제 해결을 위해 LLM의 원본 응답을 그대로 보여줍니다.")
-            st.json({"llm_responses": debug_info})
+            # 1. 청크별 분석 결과
+            with st.expander("1. 청크별 상세 분석 결과 보기"):
+                if stats_data.get("chunk_stats"):
+                    df_chunk = pd.DataFrame(stats_data["chunk_stats"])
+                    st.table(df_chunk.set_index("청크 번호"))
+                else:
+                    st.write("청크 분석 결과가 없습니다.")
+            
+            # 2. 중복 및 최종 결과 요약
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("**중복 발견 항목**")
+                dup_counts = stats_data.get("duplicate_counts", {})
+                st.metric(label="Chapters (หมวด)", value=dup_counts.get("chapter", 0))
+                st.metric(label="Sections (ส่วน)", value=dup_counts.get("section", 0))
+                st.metric(label="Articles (มาตรา)", value=dup_counts.get("article", 0))
+            
+            with col2:
+                st.write("**최종 항목 (고유)**")
+                final_counts = stats_data.get("final_counts", {})
+                st.metric(label="Chapters (หมวด)", value=final_counts.get("chapter", 0))
+                st.metric(label="Sections (ส่วน)", value=final_counts.get("section", 0))
+                st.metric(label="Articles (มาตรา)", value=final_counts.get("article", 0))
 
             # 최종 결과 다운로드 버튼
             st.download_button(
@@ -50,3 +67,8 @@ if uploaded_file is not None:
                file_name=f"{uploaded_file.name.split('.')[0]}_structure.json",
                mime="application/json",
             )
+            
+            # 디버깅 정보를 항상 맨 아래에 표시
+            st.subheader("🔍 디버깅 정보")
+            st.warning("이 섹션은 문제 해결을 위해 LLM의 원본 응답을 그대로 보여줍니다.")
+            st.json({"llm_responses": debug_info})

@@ -5,24 +5,35 @@ import json
 import traceback
 from collections import Counter
 
-# (이전의 helper 함수들은 동일하게 유지)
+# 헬퍼 함수: LLM 응답에서 JSON 추출
 def extract_json_from_response(text):
     if '```json' in text:
-        try: return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
-        except (json.JSONDecodeError, IndexError): return None
-    try: return json.loads(text)
-    except json.JSONDecodeError: return None
+        try:
+            return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
+        except (json.JSONDecodeError, IndexError):
+            return None
+    
+    try:
+        # 코드 블록이 없는 경우, 순수 JSON으로 가정
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
 
+# 헬퍼 함수: 의미 기반 청킹
 def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
     if len(text) <= chunk_size_chars:
         return [{"start_char": 0, "end_char": len(text), "text": text}]
-    chunks, start_char = [], 0
+
+    chunks = []
+    start_char = 0
     while start_char < len(text):
         ideal_end = start_char + chunk_size_chars
         actual_end = min(ideal_end, len(text))
+        
         if ideal_end >= len(text):
             chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end]})
             break
+
         separators = ["\n\n", ". ", " ", ""]
         best_sep_pos = -1
         for sep in separators:
@@ -31,12 +42,14 @@ def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
             if best_sep_pos != -1:
                 actual_end = best_sep_pos + len(sep)
                 break
-        if best_sep_pos == -1: actual_end = ideal_end
+        if best_sep_pos == -1:
+            actual_end = ideal_end
+
         chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end]})
         start_char = actual_end - overlap_chars
     return chunks
 
-# ✅✅✅ 디버깅 및 안정성이 강화된 최종 파이프라인 ✅✅✅
+# 디버깅 및 안정성이 강화된 최종 파이프라인
 def run_full_pipeline(document_text, api_key, status_container):
     model_name = 'gemini-2.5-flash-lite'
     genai.configure(api_key=api_key)
@@ -63,7 +76,9 @@ def run_full_pipeline(document_text, api_key, status_container):
     # 3. 각 청크별 구조 분석
     all_headers = []
     chunk_stats = []
-    prompt_structure = """As an expert JSON generator... [Text Chunk]\n{text_chunk}""" # (이전과 동일하여 생략)
+    prompt_structure = """As an expert JSON generator, analyze the following Thai legal text chunk. Identify all headers like 'หมวด', 'ส่วน', 'มาตรา'. For each, return a JSON object with 'type', 'title', 'start_index', and 'end_index'. Return a JSON array of these objects. If no headers are found, return an empty array [].
+[Text Chunk]
+{text_chunk}"""
     
     for i, chunk in enumerate(chunks):
         chunk_num = i + 1
@@ -72,7 +87,7 @@ def run_full_pipeline(document_text, api_key, status_container):
             prompt = prompt_structure.format(text_chunk=chunk["text"])
             response = model.generate_content(prompt)
             
-            # ✅ LLM의 모든 응답을 디버깅 정보에 먼저 기록
+            # LLM의 모든 응답을 디버깅 정보에 먼저 기록
             debug_info.append({f"chunk_{chunk_num}_response": response.text})
 
             headers_in_chunk = extract_json_from_response(response.text)
@@ -96,7 +111,7 @@ def run_full_pipeline(document_text, api_key, status_container):
     # 4. 결과 통합
     status_container.write("4/4: 결과 통합 및 중복 제거 중...")
     
-    # (try-except 블록 추가하여 'global_start' 키에 대한 오류 방지)
+    unique_headers, duplicate_counts, final_counts = [], {}, {}
     try:
         original_counts = Counter(h.get('type', 'unknown') for h in all_headers)
         unique_headers_map = {(h['global_start'], h['title']): h for h in all_headers}
@@ -108,10 +123,7 @@ def run_full_pipeline(document_text, api_key, status_container):
             "article": original_counts.get('มาตรา', 0) - final_counts.get('มาตรา', 0)
         }
     except KeyError as e:
-        # 키 오류 발생 시, 빈 값으로 설정하고 디버그 정보에 기록
-        unique_headers, duplicate_counts, final_counts = [], {}, {}
         debug_info.append({"deduplication_error": f"중복 제거 중 키 오류 발생: {e}"})
-
 
     final_result_data = {
         "global_summary": global_summary,
