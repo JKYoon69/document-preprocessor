@@ -4,56 +4,93 @@ import google.generativeai as genai
 import json
 import traceback
 from collections import Counter
-import time # 시간 측정을 위해 추가
+import time
 
-# (extract_json_from_response 와 chunk_text_semantic 함수는 이전과 동일)
 def extract_json_from_response(text):
+    """
+    LLM의 응답 텍스트에서 JSON 코드 블록을 추출하여 파싱합니다.
+    """
     if '```json' in text:
-        try: return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
-        except (json.JSONDecodeError, IndexError): return None
-    try: return json.loads(text)
-    except json.JSONDecodeError: return None
+        try:
+            # ```json ``` 블록이 있는 경우
+            return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
+        except (json.JSONDecodeError, IndexError):
+            return None
+    
+    try:
+        # 코드 블록이 없는 순수 JSON 텍스트인 경우
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
 
 def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
+    """
+    문장, 문단 등 의미있는 경계를 찾아 청크를 나누는 함수.
+    각 청크는 딕셔너리 형태로, 'text'와 'global_start' 키를 포함합니다.
+    """
     if len(text) <= chunk_size_chars:
-        return [{"start_char": 0, "end_char": len(text), "text": text}]
-    chunks, start_char = [], 0
+        return [{"start_char": 0, "end_char": len(text), "text": text, "global_start": 0}]
+
+    chunks = []
+    start_char = 0
     while start_char < len(text):
         ideal_end = start_char + chunk_size_chars
         actual_end = min(ideal_end, len(text))
+        
+        # 마지막 청크 처리
         if ideal_end >= len(text):
-            chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end]})
+            chunks.append({
+                "start_char": start_char, 
+                "end_char": actual_end, 
+                "text": text[start_char:actual_end],
+                "global_start": start_char
+            })
             break
+
+        # 의미있는 경계 찾기 (뒤에서부터 탐색)
         separators = ["\n\n", ". ", " ", ""]
         best_sep_pos = -1
         for sep in separators:
+            # 검색 범위를 제한하여 효율성 증대
             search_start = max(start_char, ideal_end - 5000)
             best_sep_pos = text.rfind(sep, search_start, ideal_end)
             if best_sep_pos != -1:
                 actual_end = best_sep_pos + len(sep)
                 break
-        if best_sep_pos == -1: actual_end = ideal_end
-        chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end]})
+        
+        if best_sep_pos == -1: # 적절한 분리 지점을 못 찾으면 그냥 자름
+            actual_end = ideal_end
+
+        chunks.append({
+            "start_char": start_char, 
+            "end_char": actual_end, 
+            "text": text[start_char:actual_end],
+            "global_start": start_char
+        })
         start_char = actual_end - overlap_chars
     return chunks
 
-# 디버깅 및 안정성이 강화된 최종 파이프라인
 def run_full_pipeline(document_text, api_key, status_container):
+    """
+    전체 파이프라인을 실행하여 구조 분석 및 통계 데이터를 반환합니다.
+    """
     model_name = 'gemini-2.5-flash-lite'
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
     
     debug_info = []
+    all_headers = []
+    chunk_stats = []
 
-    # 1. 전역 요약
+    # 1. 전역 요약 생성
     status_container.write("1/4: 문서 전역 요약 생성 중...")
     try:
         preamble = document_text[:4000]
         prompt_global = f"Summarize the following Thai legal document preamble in Korean. Respond with the summary text only.\n\n[Preamble]\n{preamble}"
         
-        start_time = time.time() # 시간 측정 시작
+        start_time = time.time()
         response_summary = model.generate_content(prompt_global)
-        end_time = time.time()   # 시간 측정 종료
+        end_time = time.time()
         
         global_summary = response_summary.text.strip()
         debug_info.append({"global_summary_response_time": f"{end_time - start_time:.2f} 초"})
@@ -68,8 +105,6 @@ def run_full_pipeline(document_text, api_key, status_container):
     status_container.write(f"분할 완료: 총 {len(chunks)}개 청크 생성됨.")
     
     # 3. 각 청크별 구조 분석
-    all_headers = []
-    chunk_stats = []
     prompt_structure = """As an expert JSON generator, analyze the following Thai legal text chunk. Identify all headers like 'หมวด', 'ส่วน', 'มาตรา'. For each, return a JSON object with 'type', 'title', 'start_index', and 'end_index'. Return a JSON array of these objects. If no headers are found, return an empty array [].
 [Text Chunk]
 {text_chunk}"""
@@ -80,9 +115,9 @@ def run_full_pipeline(document_text, api_key, status_container):
         try:
             prompt = prompt_structure.format(text_chunk=chunk["text"])
             
-            start_time = time.time() # 시간 측정 시작
+            start_time = time.time()
             response = model.generate_content(prompt)
-            end_time = time.time()   # 시간 측정 종료
+            end_time = time.time()
             
             debug_info.append({
                 f"chunk_{chunk_num}_response_time": f"{end_time - start_time:.2f} 초",
@@ -107,19 +142,31 @@ def run_full_pipeline(document_text, api_key, status_container):
             debug_info.append({f"chunk_{chunk_num}_critical_error": traceback.format_exc()})
             continue
 
-    # 4. 결과 통합 (이전과 동일)
+    # 4. 결과 통합 및 중복 제거
     status_container.write("4/4: 결과 통합 및 중복 제거 중...")
+    
     unique_headers, duplicate_counts, final_counts = [], {}, {}
     try:
         original_counts = Counter(h.get('type', 'unknown') for h in all_headers)
         unique_headers_map = {(h['global_start'], h['title']): h for h in all_headers}
         unique_headers = sorted(list(unique_headers_map.values()), key=lambda x: x['global_start'])
         final_counts = Counter(h.get('type', 'unknown') for h in unique_headers)
-        duplicate_counts = {"chapter": original_counts.get('หมวด', 0) - final_counts.get('หมวด', 0), "section": original_counts.get('ส่วน', 0) - final_counts.get('ส่วน', 0), "article": original_counts.get('มาตรา', 0) - final_counts.get('มาตรา', 0)}
+        duplicate_counts = {
+            "chapter": original_counts.get('หมวด', 0) - final_counts.get('หมวด', 0),
+            "section": original_counts.get('ส่วน', 0) - final_counts.get('ส่วน', 0),
+            "article": original_counts.get('มาตรา', 0) - final_counts.get('มาตรา', 0)
+        }
     except KeyError as e:
         debug_info.append({"deduplication_error": f"중복 제거 중 키 오류 발생: {e}"})
 
-    final_result_data = {"global_summary": global_summary, "structure": unique_headers}
-    stats_data = {"chunk_stats": chunk_stats, "duplicate_counts": duplicate_counts, "final_counts": final_counts}
+    final_result_data = {
+        "global_summary": global_summary,
+        "structure": unique_headers
+    }
+    stats_data = {
+        "chunk_stats": chunk_stats,
+        "duplicate_counts": duplicate_counts,
+        "final_counts": final_counts
+    }
 
     return final_result_data, stats_data, debug_info
