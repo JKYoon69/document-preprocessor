@@ -4,7 +4,7 @@ import google.generativeai as genai
 import json
 import time
 
-# 헬퍼 함수 (이전과 동일)
+# 헬퍼 함수: LLM 응답에서 JSON 추출 (이전과 동일)
 def extract_json_from_response(text):
     try:
         start = text.find('```json') + len('```json')
@@ -18,8 +18,8 @@ def extract_json_from_response(text):
         print(f"JSON 파싱 오류: {e}\n원본 텍스트: {text}")
         return None
 
-# 헬퍼 함수: 텍스트를 청크로 분할 (이전과 동일)
-def chunk_text(text, chunk_size=100000, overlap=10000):
+# ⭐️ 헬퍼 함수: 텍스트를 청크로 분할 (100kb / 20% 중첩으로 수정)
+def chunk_text(text, chunk_size=100000, overlap=20000): # 100kb, 20% overlap
     chunks = []
     start = 0
     while start < len(text):
@@ -38,35 +38,47 @@ def run_pipeline(document_text, api_key, status_container):
     model_name = 'gemini-2.5-flash-lite'
     genai.configure(api_key=api_key)
     
-    # ⭐️ 1. 시스템 명령어 추가: 모델이 JSON 생성에 더 집중하도록 역할 부여
     system_instruction = "You are an expert in analyzing legal documents and your primary task is to return data in a clean, valid JSON format."
     model = genai.GenerativeModel(
         model_name,
         system_instruction=system_instruction
     )
 
-    # ... (Global Summary 생성 부분은 동일) ...
+    # 1. Global Summary 생성
     status_container.write(f"1/3: **{model_name}** 모델로 **'전역 요약'**을 생성합니다...")
     preamble = document_text[:3000]
-    prompt_global_summary = f"""Analyze the preamble...""" # (이전과 동일하여 생략)
+    prompt_global_summary = f"""Analyze the preamble of the Thai legal document provided below. Summarize the document's purpose, background, and core principles in 2-3 sentences in Korean.\n\n[Preamble text]\n{preamble}"""
     response_summary = model.generate_content(prompt_global_summary)
     generated_global_summary = response_summary.text.strip()
-    
+
+    # 2. 청크 분할
     status_container.write(f"2/3: 문서 분할...")
-    document_chunks = chunk_text(document_text)
-    status_container.write(f"총 {len(document_chunks)}개 청크 분할 완료.")
+    document_chunks = chunk_text(document_text) # 수정된 chunk_text 함수 사용
+    status_container.write(f"총 {len(document_chunks)}개의 청크로 분할되었습니다. 각 청크별로 구조 분석을 시작합니다.")
     time.sleep(1)
 
+    # 3. 각 청크별 구조 분석 및 결과 병합
     all_headers = []
-    prompt_structure_index_only = """The following text is part of a Thai legal document...""" # (이전과 동일하여 생략)
+    prompt_structure_template = """The following text is part of a Thai legal document. Identify all hierarchical headers such as 'หมวด', 'ส่วน', and 'มาตรา'.
+For each identified element, extract its type, title, and its character start/end positions within the provided text.
+Return the result as a JSON array. Ensure every object in the array contains 'type', 'title', 'start_index', and 'end_index' keys.
+
+Example format:
+[{"type": "chapter", "title": "หมวด 1", "start_index": 10, "end_index": 500}]
+
+[Text Chunk]
+{text_chunk}"""
 
     for i, chunk in enumerate(document_chunks):
         status_container.write(f"3/{len(document_chunks)+2}: 청크 {i+1}/{len(document_chunks)}를 분석 중입니다...")
         
-        try: # ⭐️ 2. 더 넓은 범위의 오류 잡기
-            response = model.generate_content(prompt_structure_index_only.format(text_chunk=chunk["text"]))
+        try:
+            # ⭐️⭐️⭐️ 여기가 핵심 수정 부분: .format()을 사용하여 프롬프트에 실제 청크 텍스트를 삽입
+            final_prompt = prompt_structure_template.format(text_chunk=chunk["text"])
             
-            # ⭐️ 3. LLM의 원본 응답을 화면에 직접 출력 (디버깅 목적)
+            response = model.generate_content(final_prompt)
+            
+            # 디버깅을 위해 원본 응답을 계속 표시
             status_container.info(f"청크 {i+1}에 대한 LLM 원본 응답:\n```\n{response.text}\n```")
             
             headers_in_chunk = extract_json_from_response(response.text)
@@ -84,12 +96,10 @@ def run_pipeline(document_text, api_key, status_container):
 
         except Exception as e:
             status_container.error(f"청크 {i+1} 처리 중 예상치 못한 오류 발생: {e}")
-            # 오류가 발생한 청크는 건너뛰고 계속 진행
             continue
 
     status_container.write("모든 청크 분석 완료. 결과 병합 및 중복을 제거합니다...")
     if not all_headers:
-         # 헤더가 하나도 없는 경우 처리
         return {
             "global_summary": generated_global_summary,
             "document_title": f"분석된 문서 (모델: {model_name})",
