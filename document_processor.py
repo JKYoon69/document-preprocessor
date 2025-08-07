@@ -57,6 +57,7 @@ def run_extraction_pipeline(document_text, api_key, status_container):
     debug_info = []
     all_headers = []
     chunk_stats = []
+    global_summary = ""
 
     # 1. 전역 요약 생성
     status_container.write("1/3: 문서 전역 요약 생성 중...")
@@ -124,7 +125,7 @@ Example of expected output for a chunk:
             debug_info.append({f"chunk_{chunk_num}_response": response.text})
             headers_in_chunk = extract_json_from_response(response.text)
             
-            if isinstance(headers_in_chunk, list):
+            if isinstance(headers_in_chunk, list) and headers_in_chunk:
                 counts = Counter(h.get('type', 'unknown') for h in headers_in_chunk)
                 chunk_stats.append({"Chunk Number": chunk_num, "book": counts.get('book',0), "part": counts.get('part',0), "chapter": counts.get('chapter', 0), "section": counts.get('section', 0), "article": counts.get('article', 0)})
                 for header in headers_in_chunk:
@@ -142,14 +143,12 @@ Example of expected output for a chunk:
     status_container.write("3/3: 결과 통합 및 중복 제거 중...")
     
     if not all_headers:
-        # 이 경우에도 통계와 디버그 정보는 반환
-        final_result_data = {"global_summary": global_summary, "structure": []}
+        final_result_data = {"global_summary": global_summary, "structure": [], "error": "LLM이 구조를 전혀 추출하지 못했습니다."}
         stats_data = {"chunk_stats": chunk_stats, "duplicate_counts": {}, "final_counts": {}}
         return final_result_data, stats_data, debug_info
 
     unique_headers = sorted(list({h['global_start']: h for h in all_headers}.values()), key=lambda x: x['global_start'])
     
-    # 누락된 서문 추가 및 간격 제거
     if unique_headers and unique_headers[0]["global_start"] > 0:
         unique_headers.insert(0, {"type": "preamble", "title": "Preamble", "global_start": 0, "global_end": unique_headers[0]["global_start"]})
     for i in range(len(unique_headers) - 1):
@@ -157,15 +156,10 @@ Example of expected output for a chunk:
     if unique_headers:
         unique_headers[-1]["global_end"] = len(document_text)
 
-    # 각 노드에 텍스트 채우기
     for header in unique_headers:
         header["text"] = document_text[header["global_start"]:header["global_end"]]
 
-    final_result_data = {
-        "global_summary": global_summary,
-        "structure": unique_headers
-    }
-    # 통계 계산은 이 안정화된 버전에서는 생략하고 다음 단계에 추가
+    final_result_data = {"global_summary": global_summary, "structure": unique_headers}
     stats_data = {} 
     
     return final_result_data, stats_data, debug_info
