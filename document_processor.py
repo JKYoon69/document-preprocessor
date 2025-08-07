@@ -6,7 +6,6 @@ import traceback
 from collections import Counter
 import time
 
-# (extract_json_from_response 와 chunk_text_semantic 함수는 이전과 동일)
 def extract_json_from_response(text):
     if '```json' in text:
         try: return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
@@ -35,111 +34,98 @@ def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
         start_char = actual_end - overlap_chars
     return chunks
 
-# --- 디버깅이 강화된 파이프라인 함수 ---
-def run_full_pipeline(document_text, api_key, status_container):
+def build_tree(flat_list):
+    if not flat_list: return []
+    hierarchy = {"book": 0, "part": 1, "chapter": 2, "section": 3, "article": 4, "preamble": 5}
+    for node in flat_list:
+        node["level"] = hierarchy.get(node.get("type"), 5)
+    root = {"children": [], "level": -1}
+    stack = [root]
+    for node in flat_list:
+        while stack[-1]["level"] >= node["level"]:
+            stack.pop()
+        parent = stack[-1]
+        if "children" not in parent: parent["children"] = []
+        parent["children"].append(node)
+        if node["level"] < 4: stack.append(node)
+    def finalize_structure(node):
+        if "children" in node:
+            node["sections"] = [child for child in node["children"] if child.get("level") < 4]
+            node["articles"] = [child for child in node["children"] if child.get("level") >= 4]
+            for section in node["sections"]: finalize_structure(section)
+            if not node["sections"]: del node["sections"]
+            if not node["articles"]: del node["articles"]
+            del node["children"]
+        del node["level"], node["global_start"], node["global_end"]
+    for child in root["children"]: finalize_structure(child)
+    return root["children"]
+
+def summarize_nodes_recursively(node, model, global_summary, status_container):
+    if "sections" in node:
+        for section in node["sections"]:
+            summarize_nodes_recursively(section, model, global_summary, status_container)
+    if "articles" in node:
+        for article in node["articles"]:
+            status_container.write(f"...Summarizing: {article.get('title', 'Unknown Article')}")
+            prompt = f"Based on the global summary '{global_summary}', please summarize the following article '{article.get('title')}' in one sentence in Korean.\n\nText:\n{article.get('text')}"
+            response = model.generate_content(prompt)
+            article["summary"] = response.text.strip()
+    if "sections" in node or "articles" in node:
+        child_summaries = ""
+        if "sections" in node: child_summaries += "\n".join([f"- {s.get('title')}: {s.get('summary', '')}" for s in node["sections"]])
+        if "articles" in node: child_summaries += "\n".join([f"- {a.get('title')}: {a.get('summary', '')}" for a in node["articles"]])
+        status_container.write(f"...Summarizing parent node: {node.get('title', 'Unknown Node')}")
+        prompt = f"Based on the global summary '{global_summary}', please synthesize the following summaries of child nodes into a comprehensive summary for the parent node '{node.get('title')}' in Korean.\n\nChild Summaries:\n{child_summaries}"
+        response = model.generate_content(prompt)
+        node["summary"] = response.text.strip()
+
+def run_final_pipeline(document_text, api_key, status_container):
     model_name = 'gemini-2.5-flash-lite'
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
     
-    debug_info = []
-    all_headers = []
-    chunk_stats = []
-    global_summary = ""
+    status_container.write("1/5: Generating global summary...")
+    preamble_text = document_text[:4000]
+    prompt_global = f"Summarize the preamble of this Thai legal document in Korean.\n\n[Preamble]\n{preamble_text}"
+    response_summary = model.generate_content(prompt_global)
+    global_summary = response_summary.text.strip()
 
-    # 1. 전역 요약
-    status_container.write("1/4: 문서 전역 요약 생성 중...")
-    try:
-        preamble = document_text[:4000]
-        prompt_global = f"Summarize the preamble of this Thai legal document in Korean.\n\n[Preamble]\n{preamble}"
-        response_summary = model.generate_content(prompt_global)
-        global_summary = response_summary.text.strip()
-    except Exception as e:
-        global_summary = f"전역 요약 생성 중 오류 발생: {e}"
-        debug_info.append({"global_summary_error": traceback.format_exc()})
-
-    # 2. 청크 분할
-    status_container.write("2/4: 문서를 의미 기반 청크로 분할 중...")
+    status_container.write("2/5: Chunking and analyzing structure...")
     chunks = chunk_text_semantic(document_text)
-    status_container.write(f"분할 완료: 총 {len(chunks)}개 청크 생성됨.")
-    
-    # 3. 각 청크별 구조 분석
-    prompt_structure = """You are a precise data extraction tool. Your task is to analyze the following chunk of a Thai legal document and identify all hierarchical headers.
-Follow these rules STRICTLY:
-1.  Identify headers such as 'ภาค', 'ลักษณะ', 'หมวด', 'ส่วน', and 'มาตรา'.
-2.  For each header, create a JSON object.
-3.  The `title` field MUST contain ONLY the header text itself (e.g., "มาตรา ๑"), NOT the full text of the article.
-4.  Map the Thai header to the `type` field using these exact rules:
-    - 'ภาค' -> 'book'
-    - 'ลักษณะ' -> 'part'
-    - 'หมวด' -> 'chapter'
-    - 'ส่วน' -> 'section'
-    - 'มาตรา' -> 'article'
-5.  Provide the character `start_index` and `end_index` for the entire element (header + its content).
-6.  Return a single JSON array of these objects. If no headers are found, return an empty array [].
-Example:
-[
-  {{
-    "type": "chapter",
-    "title": "หมวด ๑ บทบัญญัติทั่วไป",
-    "start_index": 120,
-    "end_index": 950
-  }},
-  {{
-    "type": "article",
-    "title": "มาตรา ๑",
-    "start_index": 250,
-    "end_index": 400
-  }}
-]
-[Text Chunk]
-{text_chunk}"""
-    
+    all_headers = []
+    prompt_structure = """You are a precise data extraction tool... [Text Chunk]\n{text_chunk}"""
     for i, chunk in enumerate(chunks):
-        chunk_num = i + 1
-        status_container.write(f"3/4: 청크 {chunk_num}/{len(chunks)} 구조 분석 중...")
-        try:
-            prompt = prompt_structure.format(text_chunk=chunk["text"])
-            response = model.generate_content(prompt)
-            debug_info.append({f"chunk_{chunk_num}_response": response.text})
-            headers_in_chunk = extract_json_from_response(response.text)
-            
-            if isinstance(headers_in_chunk, list) and headers_in_chunk: # 리스트가 비어있지 않은지도 확인
-                counts = Counter(h.get('type', 'unknown') for h in headers_in_chunk)
-                chunk_stats.append({"Chunk Number": chunk_num, "book": counts.get('book',0), "part": counts.get('part',0), "chapter": counts.get('chapter', 0), "section": counts.get('section', 0), "article": counts.get('article', 0)})
-                for header in headers_in_chunk:
-                    if isinstance(header, dict) and all(k in header for k in ['type', 'title', 'start_index', 'end_index']):
-                        header["global_start"] = header["start_index"] + chunk["global_start"]
-                        header["global_end"] = header["end_index"] + chunk["global_start"]
-                        all_headers.append(header)
-            else:
-                debug_info.append({f"chunk_{chunk_num}_parsing_error": "응답이 유효한 JSON 리스트가 아닙니다."})
-        except Exception as e:
-            status_container.error(f"청크 {chunk_num} 처리 중 오류: {traceback.format_exc()}")
-            debug_info.append({f"chunk_{chunk_num}_critical_error": traceback.format_exc()})
-            continue
+        prompt = prompt_structure.format(text_chunk=chunk["text"])
+        response = model.generate_content(prompt)
+        headers_in_chunk = extract_json_from_response(response.text)
+        if isinstance(headers_in_chunk, list):
+            for header in headers_in_chunk:
+                if isinstance(header, dict) and all(k in header for k in ['type', 'title', 'start_index', 'end_index']):
+                    header["global_start"] = header["start_index"] + chunk["global_start"]
+                    header["global_end"] = header["end_index"] + chunk["global_start"]
+                    all_headers.append(header)
 
-    # 4. 결과 통합
-    status_container.write("4/4: 결과 통합 및 중복 제거 중...")
-    
-    # ✅✅✅ 오류 방지 로직 추가 ✅✅✅
-    # all_headers가 비어있으면, 오류 메시지와 함께 빈 결과를 반환
-    if not all_headers:
-        final_result_data = {"global_summary": global_summary, "structure": [], "error": "LLM이 구조를 전혀 추출하지 못했습니다."}
-        stats_data = {"chunk_stats": chunk_stats, "duplicate_counts": {}, "final_counts": {}}
-        return final_result_data, stats_data, debug_info
+    status_container.write("3/5: Post-processing data...")
+    if not all_headers: raise ValueError("LLM did not extract any structure.")
+    unique_headers = sorted(list({h['global_start']: h for h in all_headers}.values()), key=lambda x: x['global_start'])
+    if unique_headers[0]["global_start"] > 0:
+        preamble_node = {"type": "preamble", "title": "Preamble", "global_start": 0, "global_end": unique_headers[0]["global_start"]}
+        unique_headers.insert(0, preamble_node)
+    for i in range(len(unique_headers) - 1):
+        unique_headers[i]["global_end"] = unique_headers[i+1]["global_start"]
+    unique_headers[-1]["global_end"] = len(document_text)
+    for header in unique_headers:
+        header["text"] = document_text[header["global_start"]:header["global_end"]]
 
-    # (이하 로직은 all_headers에 내용이 있을 때만 실행됨)
-    unique_headers, duplicate_counts, final_counts = [], {}, {}
-    try:
-        original_counts = Counter(h.get('type', 'unknown') for h in all_headers)
-        unique_headers_map = {(h['global_start'], h['title']): h for h in all_headers}
-        unique_headers = sorted(list(unique_headers_map.values()), key=lambda x: x['global_start'])
-        final_counts = Counter(h.get('type', 'unknown') for h in unique_headers)
-        duplicate_counts = {"book": original_counts.get('book', 0) - final_counts.get('book', 0), "part": original_counts.get('part', 0) - final_counts.get('part', 0), "chapter": original_counts.get('chapter', 0) - final_counts.get('chapter', 0), "section": original_counts.get('section', 0) - final_counts.get('section', 0), "article": original_counts.get('article', 0) - final_counts.get('article', 0)}
-    except KeyError as e:
-        debug_info.append({"deduplication_error": f"중복 제거 중 키 오류 발생: {e}"})
+    status_container.write("4/5: Building hierarchical tree...")
+    hierarchical_tree = build_tree(unique_headers)
 
-    final_result_data = {"global_summary": global_summary, "structure": unique_headers}
-    stats_data = {"chunk_stats": chunk_stats, "duplicate_counts": duplicate_counts, "final_counts": final_counts}
+    status_container.write("5/5: Summarizing nodes...")
+    for root_node in hierarchical_tree:
+        summarize_nodes_recursively(root_node, model, global_summary, status_container)
 
-    return final_result_data, stats_data, debug_info
+    return {
+        "global_summary": global_summary,
+        "document_title": "Thai Legal Document Analysis",
+        "chapters": hierarchical_tree
+    }

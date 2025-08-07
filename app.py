@@ -23,7 +23,8 @@ if uploaded_file is not None:
         with st.status("분석을 시작합니다...", expanded=True) as status:
             try:
                 api_key = st.secrets["GEMINI_API_KEY"]
-                final_result, stats, debug_info = document_processor.run_full_pipeline(
+                # ✅✅✅ 함수 이름을 'run_final_pipeline'으로 수정 ✅✅✅
+                final_result, stats, debug_info = document_processor.run_final_pipeline(
                     document_text=document_text, 
                     api_key=api_key,
                     status_container=status
@@ -56,7 +57,6 @@ if st.session_state.analysis_result:
     if stats_data and stats_data.get("chunk_stats"):
         st.write(f"총 **{len(stats_data['chunk_stats'])}** 개의 청크로 분할되었습니다.")
     else:
-        # 청크 통계가 없으면, chunker에서 나온 청크 개수라도 표시
         num_chunks = len([d for d in debug_info if "chunk_" in next(iter(d))])
         st.write(f"총 **{num_chunks}** 개의 청크로 분할되었습니다.")
 
@@ -83,7 +83,7 @@ if st.session_state.analysis_result:
     with st.expander("최종 결과 미리보기 (JSON)", expanded=False):
         st.json(final_result_data)
     
-    with st.expander("디버그 로그 미리보기 (JSON)", expanded=True): # 디버깅을 위해 기본으로 펼쳐놓음
+    with st.expander("디버그 로그 미리보기 (JSON)", expanded=True):
         st.json({"llm_responses": debug_info})
 
     col1_dl, col2_dl = st.columns(2)
