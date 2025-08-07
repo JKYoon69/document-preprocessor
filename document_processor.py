@@ -37,49 +37,68 @@ def run_pipeline(document_text, api_key, status_container):
     
     model_name = 'gemini-2.5-flash-lite'
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
+    
+    # ⭐️ 1. 시스템 명령어 추가: 모델이 JSON 생성에 더 집중하도록 역할 부여
+    system_instruction = "You are an expert in analyzing legal documents and your primary task is to return data in a clean, valid JSON format."
+    model = genai.GenerativeModel(
+        model_name,
+        system_instruction=system_instruction
+    )
 
-    # 1. Global Summary 생성
+    # ... (Global Summary 생성 부분은 동일) ...
     status_container.write(f"1/3: **{model_name}** 모델로 **'전역 요약'**을 생성합니다...")
     preamble = document_text[:3000]
-    prompt_global_summary = f"""Analyze the preamble of the Thai legal document provided below. Summarize the document's purpose, background, and core principles in 2-3 sentences in Korean. [Preamble text]\n{preamble}"""
+    prompt_global_summary = f"""Analyze the preamble...""" # (이전과 동일하여 생략)
     response_summary = model.generate_content(prompt_global_summary)
     generated_global_summary = response_summary.text.strip()
-
-    # 2. 청크 분할
-    status_container.write(f"2/3: 문서가 크므로 작은 조각(청크)으로 분할합니다...")
+    
+    status_container.write(f"2/3: 문서 분할...")
     document_chunks = chunk_text(document_text)
-    status_container.write(f"총 {len(document_chunks)}개의 청크로 분할되었습니다. 각 청크별로 구조 분석을 시작합니다.")
+    status_container.write(f"총 {len(document_chunks)}개 청크 분할 완료.")
     time.sleep(1)
 
-    # 3. 각 청크별 구조 분석 및 결과 병합
     all_headers = []
-    prompt_structure_index_only = """The following text is part of a Thai legal document. Identify all hierarchical headers such as 'หมวด', 'ส่วน', and 'มาตรา'. For each identified element, extract its type, title, and its character start/end positions within the provided text. Return the result as a JSON array. Ensure every object in the array contains 'type', 'title', 'start_index', and 'end_index' keys. Example format: [{"type": "chapter", "title": "หมวด 1", "start_index": 10, "end_index": 500}] [Text Chunk]\n{text_chunk}"""
+    prompt_structure_index_only = """The following text is part of a Thai legal document...""" # (이전과 동일하여 생략)
 
     for i, chunk in enumerate(document_chunks):
         status_container.write(f"3/{len(document_chunks)+2}: 청크 {i+1}/{len(document_chunks)}를 분석 중입니다...")
         
-        response = model.generate_content(prompt_structure_index_only.format(text_chunk=chunk["text"]))
-        headers_in_chunk = extract_json_from_response(response.text)
-        
-        if headers_in_chunk and isinstance(headers_in_chunk, list):
-            for header in headers_in_chunk:
-                # 👇 방어적 코드: LLM 결과가 딕셔너리 형태이고 필수 키가 모두 있는지 확인
-                if isinstance(header, dict) and all(k in header for k in ['type', 'title', 'start_index', 'end_index']):
-                    # 로컬 인덱스를 전역 인덱스로 변환
-                    header["global_start"] = header["start_index"] + chunk["global_start"]
-                    header["global_end"] = header["end_index"] + chunk["global_start"]
-                    all_headers.append(header)
-                else:
-                    # 형식이 잘못된 경우, 로그를 남기고 다음으로 넘어감
-                    status_container.warning(f"청크 {i+1}에서 예상과 다른 형식의 응답을 받았습니다. 건너뜁니다: {header}")
+        try: # ⭐️ 2. 더 넓은 범위의 오류 잡기
+            response = model.generate_content(prompt_structure_index_only.format(text_chunk=chunk["text"]))
+            
+            # ⭐️ 3. LLM의 원본 응답을 화면에 직접 출력 (디버깅 목적)
+            status_container.info(f"청크 {i+1}에 대한 LLM 원본 응답:\n```\n{response.text}\n```")
+            
+            headers_in_chunk = extract_json_from_response(response.text)
+            
+            if headers_in_chunk and isinstance(headers_in_chunk, list):
+                for header in headers_in_chunk:
+                    if isinstance(header, dict) and all(k in header for k in ['type', 'title', 'start_index', 'end_index']):
+                        header["global_start"] = header["start_index"] + chunk["global_start"]
+                        header["global_end"] = header["end_index"] + chunk["global_start"]
+                        all_headers.append(header)
+                    else:
+                        status_container.warning(f"청크 {i+1}에서 예상과 다른 형식의 응답을 받았습니다. 건너뜁니다: {header}")
+            else:
+                 status_container.warning(f"청크 {i+1}에서 유효한 리스트 형식의 JSON을 받지 못했습니다.")
 
-    # 4. 중복 제거 및 정렬
+        except Exception as e:
+            status_container.error(f"청크 {i+1} 처리 중 예상치 못한 오류 발생: {e}")
+            # 오류가 발생한 청크는 건너뛰고 계속 진행
+            continue
+
     status_container.write("모든 청크 분석 완료. 결과 병합 및 중복을 제거합니다...")
+    if not all_headers:
+         # 헤더가 하나도 없는 경우 처리
+        return {
+            "global_summary": generated_global_summary,
+            "document_title": f"분석된 문서 (모델: {model_name})",
+            "error": "문서 구조를 추출하지 못했습니다. LLM 응답을 확인해주세요."
+        }
+
     unique_headers = list({(h['global_start'], h['title']): h for h in all_headers}.values())
     sorted_headers = sorted(unique_headers, key=lambda x: x['global_start'])
 
-    # 5. 최종 결과 조립
     for header in sorted_headers:
         header["text"] = document_text[header["global_start"]:header["global_end"]]
 
