@@ -22,7 +22,7 @@ def extract_json_from_response(text):
 # --- 메인 파이프라인 함수 ---
 def run_pipeline(document_text, api_key):
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    model = genai.GenerativeModel('gemini-2.5-flash-lite')
 
     # 1. Global Summary 생성 (이전과 동일, 정상 작동)
     preamble = document_text[:3000]
