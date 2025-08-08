@@ -1,51 +1,97 @@
 # document_processor.py
-
 import google.generativeai as genai
 import json
 import traceback
-from collections import Counter
 import time
 
-# 헬퍼 함수: LLM 응답에서 JSON 추출
+# --- Helper Functions ---
+
 def extract_json_from_response(text):
+    """LLM 응답에서 JSON 코드 블록을 안전하게 추출합니다."""
     if '```json' in text:
         try:
             return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
         except (json.JSONDecodeError, IndexError):
-            return None
+            # JSON 파싱 실패 시, 텍스트 자체를 로드 시도
+            pass
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         return None
 
-# 검증 완료된 의미 기반 청킹 함수
-def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
-    if len(text) <= chunk_size_chars:
-        return [{"start_char": 0, "end_char": len(text), "text": text, "global_start": 0}]
-    chunks, start_char = [], 0
-    while start_char < len(text):
-        ideal_end = start_char + chunk_size_chars
-        actual_end = min(ideal_end, len(text))
-        if ideal_end >= len(text):
-            chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end], "global_start": start_char})
-            break
-        separators = ["\n\n", ". ", " ", ""]
-        best_sep_pos = -1
-        for sep in separators:
-            search_start = max(start_char, ideal_end - 5000)
-            best_sep_pos = text.rfind(sep, search_start, ideal_end)
-            if best_sep_pos != -1:
-                actual_end = best_sep_pos + len(sep)
-                break
-        if best_sep_pos == -1:
-            actual_end = ideal_end
-        chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end], "global_start": start_char})
-        start_char = actual_end - overlap_chars
-    return chunks
+def postprocess_nodes(nodes, parent_text, global_offset=0):
+    """
+    노드 리스트를 후처리하여 인덱스를 보정하고 텍스트를 채웁니다.
+    1. global_start 기준으로 정렬 및 중복 제거
+    2. end_index를 다음 노드의 start_index로 설정하여 내용 누락 방지
+    3. 각 노드에 해당하는 원본 텍스트 추가
+    """
+    if not nodes:
+        return []
 
-# ✅✅✅ 새로운 계층적 파이프라인 함수 ✅✅✅
-def run_hierarchical_pipeline_step1(document_text, api_key, status_container):
-    model_name = 'gemini-2.5-flash'
+    # global_start를 기준으로 중복 제거 및 정렬
+    unique_nodes = sorted(
+        list({node['global_start']: node for node in nodes}.values()),
+        key=lambda x: x['global_start']
+    )
+
+    # end_index 보정
+    for i in range(len(unique_nodes) - 1):
+        unique_nodes[i]['global_end'] = unique_nodes[i+1]['global_start']
+
+    # 마지막 노드의 end_index는 부모 텍스트의 끝으로 설정
+    if unique_nodes:
+        unique_nodes[-1]['global_end'] = global_offset + len(parent_text)
+
+    # 각 노드에 텍스트 채우기
+    for node in unique_nodes:
+        # global_start/end는 전체 문서 기준, 텍스트 슬라이싱은 parent_text 기준
+        local_start = node['global_start'] - global_offset
+        local_end = node['global_end'] - global_offset
+        node['text'] = parent_text[local_start:local_end]
+        node['children'] = [] # 하위 노드를 담을 리스트 초기화
+
+    return unique_nodes
+
+
+# --- Core Extraction Logic ---
+
+def _extract_structure(text_chunk, global_offset, model, safety_settings, prompt_template, debug_info, chunk_name):
+    """지정된 프롬프트를 사용하여 텍스트 청크에서 구조를 추출하는 범용 함수"""
+    extracted_nodes = []
+    try:
+        prompt = prompt_template.format(text_chunk=text_chunk)
+        response = model.generate_content(prompt, safety_settings=safety_settings)
+        
+        # 디버깅을 위해 원본 응답 저장
+        response_text = response.text
+        debug_info.append({f"{chunk_name}_response": response_text})
+
+        nodes_in_chunk = extract_json_from_response(response_text)
+
+        if isinstance(nodes_in_chunk, list):
+            for node in nodes_in_chunk:
+                if isinstance(node, dict) and all(k in node for k in ['type', 'title', 'start_index']):
+                    # 청크 내부 인덱스를 전역 인덱스로 변환
+                    node['global_start'] = node['start_index'] + global_offset
+                    # end_index는 후처리에서 결정하므로 여기서는 사용 안 함
+                    extracted_nodes.append(node)
+        else:
+            debug_info.append({f"{chunk_name}_parsing_error": "응답이 유효한 JSON 리스트가 아닙니다."})
+
+    except Exception as e:
+        debug_info.append({f"{chunk_name}_critical_error": traceback.format_exc()})
+
+    return extracted_nodes
+
+
+def run_hybrid_pipeline(document_text, api_key, status_container):
+    """
+    Hybrid (Top-down + Post-processing) 파이프라인 실행
+    1. 최상위 구조(Chapter 등)를 먼저 추출하고 인덱스를 보정.
+    2. 각 최상위 구조 내부에서 하위 구조(Section, Article)를 추출하고 인덱스를 보정.
+    """
+    model_name = 'gemini-1.5-flash' # 모델명 변경 (gemini-2.5-flash -> gemini-1.5-flash)
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
     safety_settings = {
@@ -53,77 +99,88 @@ def run_hierarchical_pipeline_step1(document_text, api_key, status_container):
         "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE", "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
     }
     
-    # 1. 전역 요약 생성
-    status_container.write("1/4: 문서 전체 요약 생성 중...")
-    preamble_text = document_text[:4000]
-    prompt_global = f"Summarize the preamble of this Thai legal document in Korean.\n\n[Preamble]\n{preamble_text}"
-    response_summary = model.generate_content(prompt_global, safety_settings=safety_settings)
-    global_summary = response_summary.text.strip()
+    debug_info = []
+    final_tree = []
+    doc_len = len(document_text)
 
-    # 2. 의미 기반 청킹
-    status_container.write("2/4: 문서를 의미 기반 청크로 분할 중...")
-    chunks = chunk_text_semantic(document_text)
-    
-    # 3. 슬라이딩 윈도우 방식으로 Chapter 정보 추출
-    all_chapters = []
-    
-    # Chapter 추출에 최적화된 새로운 프롬프트
-    prompt_chapter_extraction = """You are an expert in Thai legal document analysis. Your task is to identify ONLY the main Chapters ('หมวด') from the provided text.
+    # --- 프롬프트 정의 ---
+    PROMPT_CHAPTERS = """You are a legal document parser for Thai law.
+Analyze the provided text and identify ONLY the top-level structural headers: 'ภาค' (book), 'ลักษณะ' (part), 'หมวด' (chapter).
+For each header, provide a JSON object with:
+1. `type`: Mapped as 'ภาค'->'book', 'ลักษณะ'->'part', 'หมวด'->'chapter'.
+2. `title`: The full header text (e.g., "หมวด ๑ บททั่วไป").
+3. `start_index`: The starting character position of the header title within the given text.
 
-Follow these rules:
-1.  Identify the introductory text before the first 'หมวด' as 'chapter0' (Preamble).
-2.  For each 'หมวด', create a JSON object with 'title', a Korean 'summary' (2-3 sentences), 'start_index', and 'end_index'.
-3.  The `end_index` for a chapter is the character right before the next chapter begins.
-4.  If there is concluding text after the last 'หมวด', identify it as 'chapterF' (Notes/References).
-5.  Return ONLY a valid JSON array of these chapter objects.
-
+Return a flat JSON array of these objects.
 [Text Chunk]
 {text_chunk}"""
 
-    # 슬라이딩 윈도우 생성
-    windows = []
-    if len(chunks) == 1:
-        windows.append(chunks[0])
-    else:
-        for i in range(len(chunks) - 1):
-            combined_text = chunks[i]['text'] + chunks[i+1]['text'][chunks[i+1]['global_start'] - (chunks[i]['global_start'] + len(chunks[i]['text'])):]
-            windows.append({'text': combined_text, 'global_start': chunks[i]['global_start']})
+    PROMPT_CHILDREN = """You are a legal document parser for Thai law.
+Analyze the provided text, which is a single chapter. Identify all 'ส่วน' (section) and 'มาตรา' (article) headers within it.
+For each header, provide a JSON object with:
+1. `type`: Mapped as 'ส่วน'->'section', 'มาตรา'->'article'.
+2. `title`: The full header text (e.g., "มาตรา ๑").
+3. `start_index`: The starting character position of the header title within the given text.
 
-    status_container.write("3/4: 슬라이딩 윈도우 방식으로 Chapter 분석 실행...")
-    for i, window in enumerate(windows):
-        status_container.write(f"... 윈도우 {i+1}/{len(windows)} 분석 중...")
-        prompt = prompt_chapter_extraction.format(text_chunk=window["text"])
-        response = model.generate_content(prompt, safety_settings=safety_settings)
-        chapters_in_window = extract_json_from_response(response.text)
+Return a flat JSON array of these objects.
+[Text Chunk]
+{text_chunk}"""
+
+    # --- 1단계: 최상위 구조 (Chapter 등) 추출 및 보정 ---
+    status_container.write(f"1/3: **{model_name}** 모델로 최상위 구조(Chapter 등) 분석 중...")
+    
+    # 문서를 청킹하지 않고 전체를 한 번에 처리 (Gemini 1.5의 긴 컨텍스트 활용)
+    top_level_nodes_raw = _extract_structure(document_text, 0, model, safety_settings, PROMPT_CHAPTERS, debug_info, "full_doc_chapters")
+    
+    # 서문(Preamble) 추가
+    if not top_level_nodes_raw or top_level_nodes_raw[0]['global_start'] > 0:
+        preamble_node = {
+            'type': 'preamble', 
+            'title': 'Preamble', 
+            'global_start': 0,
+            # end_index는 후처리에서 결정됨
+        }
+        top_level_nodes_raw.insert(0, preamble_node)
+    
+    # 후처리를 통해 top_level_nodes의 end_index 보정 및 텍스트 채우기
+    status_container.write("2/3: 추출된 Chapter 구조 후처리 및 보정 중...")
+    top_level_nodes = postprocess_nodes(top_level_nodes_raw, document_text, 0)
+
+    if not top_level_nodes:
+        status_container.error("문서에서 최상위 구조를 찾지 못했습니다.")
+        return {"error": "Failed to find any top-level structure."}, debug_info
+
+    # --- 2단계: 각 Chapter 내부의 하위 구조 (Section, Article) 추출 ---
+    status_container.write(f"3/3: 총 {len(top_level_nodes)}개의 Chapter 내부 구조 분석 중...")
+    
+    for i, parent_node in enumerate(top_level_nodes):
+        status_container.write(f"Chapter {i+1}/{len(top_level_nodes)} ('{parent_node['title']}') 분석...")
         
-        if isinstance(chapters_in_window, list):
-            for chap in chapters_in_window:
-                if isinstance(chap, dict) and all(k in chap for k in ['title', 'summary', 'start_index', 'end_index']):
-                    # 로컬 인덱스를 전역 인덱스로 변환
-                    chap["global_start"] = chap["start_index"] + window["global_start"]
-                    chap["global_end"] = chap["end_index"] + window["global_start"]
-                    all_chapters.append(chap)
+        # Preamble은 하위 구조 분석 생략
+        if parent_node['type'] == 'preamble':
+            final_tree.append(parent_node)
+            continue
 
-    # 4. 결과 통합 및 후처리
-    status_container.write("4/4: Chapter 정보 통합 및 중복 제거...")
-    if not all_chapters:
-        raise ValueError("LLM이 문서에서 Chapter 구조를 추출하지 못했습니다.")
+        # LLM으로 자식 노드 추출
+        children_nodes_raw = _extract_structure(
+            parent_node['text'], 
+            parent_node['global_start'], 
+            model, 
+            safety_settings, 
+            PROMPT_CHILDREN, 
+            debug_info,
+            f"parent_{i+1}_{parent_node['type']}"
+        )
         
-    # 중복 제거 (global_start 기준으로 고유한 chapter만 남김)
-    unique_chapters = sorted(list({c['global_start']: c for c in all_chapters}.values()), key=lambda x: x['global_start'])
+        # 후처리를 통해 자식 노드들의 인덱스 보정 및 텍스트 채우기
+        if children_nodes_raw:
+            children_nodes = postprocess_nodes(
+                children_nodes_raw, 
+                parent_node['text'], 
+                parent_node['global_start']
+            )
+            parent_node['children'] = children_nodes
+        
+        final_tree.append(parent_node)
 
-    # 인덱스 연결성 보장
-    for i in range(len(unique_chapters) - 1):
-        unique_chapters[i]["global_end"] = unique_chapters[i+1]["global_start"]
-    if unique_chapters:
-        unique_chapters[-1]["global_end"] = len(document_text)
-
-    # 임시 키 제거
-    for chap in unique_chapters:
-        if "start_index" in chap: del chap["start_index"]
-        if "end_index" in chap: del chap["end_index"]
-
-    return {
-        "global_summary": global_summary,
-        "chapters": unique_chapters
-    }
+    return {"tree": final_tree}, debug_info
