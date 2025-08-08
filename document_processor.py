@@ -19,9 +19,7 @@ def extract_json_from_response(text):
         return None
 
 def chunk_text_semantic(text, chunk_size_chars=30000, overlap_chars=3000):
-    """
-    텍스트를 의미 단위(문단, 문장)를 존중하며 지정된 크기로 청킹합니다.
-    """
+    """텍스트를 의미 단위(문단, 문장)를 존중하며 지정된 크기로 청킹합니다."""
     if len(text) <= chunk_size_chars:
         return [{"start_char": 0, "end_char": len(text), "text": text, "global_start": 0}]
 
@@ -63,18 +61,28 @@ def postprocess_nodes(nodes, parent_text, global_offset=0):
     if not nodes:
         return []
 
-    # global_start 키가 없는 비정상적인 노드 필터링 및 정렬
+    # [수정] 부모 노드의 텍스트 범위 내에 있는 자식 노드만 필터링합니다.
+    parent_start = global_offset
+    parent_end = global_offset + len(parent_text)
+    scoped_nodes = [
+        node for node in nodes 
+        if 'global_start' in node and parent_start <= node['global_start'] < parent_end
+    ]
+
+    # global_start 기준으로 중복 제거 및 정렬
     unique_nodes = sorted(
-        list({node['global_start']: node for node in nodes if 'global_start' in node}.values()),
+        list({node['global_start']: node for node in scoped_nodes}.values()),
         key=lambda x: x['global_start']
     )
 
+    # end_index 보정
     for i in range(len(unique_nodes) - 1):
         unique_nodes[i]['global_end'] = unique_nodes[i+1]['global_start']
 
     if unique_nodes:
-        unique_nodes[-1]['global_end'] = global_offset + len(parent_text)
+        unique_nodes[-1]['global_end'] = parent_end
 
+    # 각 노드에 텍스트 채우기
     for node in unique_nodes:
         local_start = node['global_start'] - global_offset
         local_end = node['global_end'] - global_offset
@@ -112,10 +120,8 @@ def _extract_structure(text_chunk, global_offset, model, safety_settings, prompt
 
 def run_hybrid_pipeline(document_text, api_key, status_container):
     """Hybrid (Top-down + Post-processing) 파이프라인 실행"""
-    # ▼▼▼ 모델명 수정 지점 ▼▼▼
-    model_name = 'gemini-2.5-flash' 
-    # ▲▲▲ 모델명 수정 지점 ▲▲▲
-    
+    # [수정] 모델명을 요청하신 gemini-1.5-flash로 최종 수정
+    model_name = 'gemini-2.5-flash'
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
     safety_settings = {
@@ -191,9 +197,26 @@ Return a flat JSON array of these objects.
             PROMPT_CHILDREN, debug_info, f"parent_{i+1}_{parent_node['type']}"
         )
         
-        if children_nodes_raw:
+        # [수정] 하위 노드 타입 검증: 'section' 또는 'article' 타입만 허용
+        allowed_child_types = {'section', 'article'}
+        validated_children_raw = [
+            child for child in children_nodes_raw if child.get('type') in allowed_child_types
+        ]
+        
+        if len(validated_children_raw) < len(children_nodes_raw):
+            debug_info.append({
+                f"parent_{i+1}_type_filtering": {
+                    "info": "Allowed only 'section' or 'article'",
+                    "original_count": len(children_nodes_raw),
+                    "filtered_count": len(validated_children_raw)
+                }
+            })
+
+        if validated_children_raw:
             children_nodes = postprocess_nodes(
-                children_nodes_raw, parent_node['text'], parent_node['global_start']
+                validated_children_raw, 
+                parent_node['text'], 
+                parent_node['global_start']
             )
             parent_node['children'] = children_nodes
         
