@@ -31,33 +31,31 @@ def chunk_text_semantic(text, chunk_size_chars=30000, overlap_chars=3000):
         ideal_end = start_char + chunk_size_chars
         actual_end = min(ideal_end, len(text))
 
-        # 문서의 끝에 도달하면 마지막 청크 추가 후 종료
         if ideal_end >= len(text):
             chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end], "global_start": start_char})
             break
 
-        # 분할 지점을 찾기 위한 구분자 (역순으로 중요도 높음)
         separators = ["\n\n", ". ", " ", ""]
         best_sep_pos = -1
         
-        # 이상적인 분할 지점 근처에서 구분자를 찾음
-        search_start = max(start_char, ideal_end - 500) # 끝에서 500자 내에서 검색
+        search_start = max(start_char, ideal_end - 500)
         for sep in separators:
             best_sep_pos = text.rfind(sep, search_start, ideal_end)
             if best_sep_pos != -1:
                 actual_end = best_sep_pos + len(sep)
                 break
         
-        if best_sep_pos == -1: # 적절한 구분자 못 찾으면 그냥 자름
+        if best_sep_pos == -1:
             actual_end = ideal_end
 
         chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end], "global_start": start_char})
         
-        # 다음 시작 지점 설정 (오버랩 적용)
-        start_char = actual_end - overlap_chars
-        if start_char < chunks[-1]['start_char'] + 100: # 무한 루프 방지
-            start_char = actual_end
-
+        next_start = actual_end - overlap_chars
+        if next_start <= (chunks[-1]['start_char'] if chunks else 0):
+             start_char = actual_end
+        else:
+             start_char = next_start
+             
     return chunks
 
 def postprocess_nodes(nodes, parent_text, global_offset=0):
@@ -65,8 +63,9 @@ def postprocess_nodes(nodes, parent_text, global_offset=0):
     if not nodes:
         return []
 
+    # global_start 키가 없는 비정상적인 노드 필터링 및 정렬
     unique_nodes = sorted(
-        list({node['global_start']: node for node in nodes}.values()),
+        list({node['global_start']: node for node in nodes if 'global_start' in node}.values()),
         key=lambda x: x['global_start']
     )
 
@@ -113,7 +112,10 @@ def _extract_structure(text_chunk, global_offset, model, safety_settings, prompt
 
 def run_hybrid_pipeline(document_text, api_key, status_container):
     """Hybrid (Top-down + Post-processing) 파이프라인 실행"""
-    model_name = 'gemini-2.5-flash'
+    # ▼▼▼ 모델명 수정 지점 ▼▼▼
+    model_name = 'gemini-2.5-flash' 
+    # ▲▲▲ 모델명 수정 지점 ▲▲▲
+    
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
     safety_settings = {
@@ -124,10 +126,28 @@ def run_hybrid_pipeline(document_text, api_key, status_container):
     debug_info = []
     final_tree = []
 
-    PROMPT_CHAPTERS = "..." # 이전과 동일
-    PROMPT_CHILDREN = "..." # 이전과 동일
+    PROMPT_CHAPTERS = """You are a legal document parser for Thai law.
+Analyze the provided text and identify ONLY the top-level structural headers: 'ภาค' (book), 'ลักษณะ' (part), 'หมวด' (chapter).
+For each header, provide a JSON object with:
+1. `type`: Mapped as 'ภาค'->'book', 'ลักษณะ'->'part', 'หมวด'->'chapter'.
+2. `title`: The full header text (e.g., "หมวด ๑ บททั่วไป").
+3. `start_index`: The starting character position of the header title within the given text.
 
-    # --- 0단계: 의미 기반 청킹 ---
+Return a flat JSON array of these objects.
+[Text Chunk]
+{text_chunk}"""
+
+    PROMPT_CHILDREN = """You are a legal document parser for Thai law.
+Analyze the provided text, which is a single chapter. Identify all 'ส่วน' (section) and 'มาตรา' (article) headers within it.
+For each header, provide a JSON object with:
+1. `type`: Mapped as 'ส่วน'->'section', 'มาตรา'->'article'.
+2. `title`: The full header text (e.g., "มาตรา ๑").
+3. `start_index`: The starting character position of the header title within the given text.
+
+Return a flat JSON array of these objects.
+[Text Chunk]
+{text_chunk}"""
+
     status_container.write("1/5: 문서를 의미 단위로 청킹하는 중...")
     chunks = chunk_text_semantic(document_text, chunk_size_chars=30000, overlap_chars=3000)
     chunking_details = [
@@ -136,7 +156,6 @@ def run_hybrid_pipeline(document_text, api_key, status_container):
     ]
     debug_info.append({"chunking_details": chunking_details})
 
-    # --- 1단계: 최상위 구조 (Chapter 등) 추출 ---
     status_container.write(f"2/5: 최상위 구조 분석 중 ({len(chunks)}개 청크)...")
     top_level_nodes_raw = []
     for i, chunk in enumerate(chunks):
@@ -147,17 +166,19 @@ def run_hybrid_pipeline(document_text, api_key, status_container):
         )
         top_level_nodes_raw.extend(nodes_in_chunk)
 
-    # --- 2단계: 최상위 구조 후처리 및 보정 ---
     status_container.write("3/5: 추출된 Chapter 구조 후처리 및 보정 중...")
-    if not top_level_nodes_raw or top_level_nodes_raw[0]['global_start'] > 0:
-        preamble_node = {'type': 'preamble', 'title': 'Preamble', 'global_start': 0}
-        top_level_nodes_raw.insert(0, preamble_node)
     
-    top_level_nodes = postprocess_nodes(top_level_nodes_raw, document_text, 0)
+    unique_nodes_by_start = {node['global_start']: node for node in top_level_nodes_raw if 'global_start' in node}
+    sorted_unique_nodes = sorted(unique_nodes_by_start.values(), key=lambda x: x['global_start'])
+
+    if not sorted_unique_nodes or sorted_unique_nodes[0]['global_start'] > 0:
+        preamble_node = {'type': 'preamble', 'title': 'Preamble', 'global_start': 0}
+        sorted_unique_nodes.insert(0, preamble_node)
+    
+    top_level_nodes = postprocess_nodes(sorted_unique_nodes, document_text, 0)
     if not top_level_nodes:
         return {"error": "Failed to find any top-level structure."}, debug_info
 
-    # --- 3단계: 각 Chapter 내부의 하위 구조 추출 ---
     status_container.write(f"4/5: 총 {len(top_level_nodes)}개 Chapter 내부 구조 분석 중...")
     for i, parent_node in enumerate(top_level_nodes):
         status_container.write(f"Chapter {i+1}/{len(top_level_nodes)} ('{parent_node['title']}') 분석...")

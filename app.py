@@ -1,4 +1,4 @@
-\# app.py
+# app.py
 import streamlit as st
 import document_processor
 import json
@@ -57,7 +57,7 @@ if st.session_state.analysis_result:
     if "error" in final_result_data or not final_result_data.get("tree"):
         st.error("분석 실패: 문서에서 유효한 구조를 추출하지 못했습니다. 아래 디버그 로그를 확인해주세요.")
     
-    # --- [신규] 청킹 정보 표시 ---
+    # 청킹 정보 표시
     chunk_info_list = [item for item in debug_info if "chunking_details" in item]
     if chunk_info_list:
         with st.expander("문서 분할(Chunking) 정보 보기"):
