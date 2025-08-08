@@ -57,7 +57,6 @@ PROMPT_DETAILER = """You are a meticulous clerk for a Thai legal section. Your m
 # --- Helper Functions ---
 
 def extract_json_from_response(text):
-    """LLM 응답에서 JSON 코드 블록을 안전하게 추출합니다."""
     if '```json' in text:
         try:
             return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
@@ -69,7 +68,6 @@ def extract_json_from_response(text):
         return None
 
 def postprocess_nodes(nodes, parent_text, global_offset=0):
-    """노드 리스트를 후처리하여 인덱스를 보정하고 텍스트를 채웁니다."""
     if not nodes:
         return []
 
@@ -101,9 +99,7 @@ def postprocess_nodes(nodes, parent_text, global_offset=0):
 # --- Core Extraction Logic ---
 
 def _extract_structure(text_chunk, global_offset, model, safety_settings, prompt_template, debug_info, step_name):
-    """LLM API를 호출하고 결과를 추출하며, 재시도 및 시간 측정을 포함합니다."""
     extracted_nodes = []
-    duration = 0
     retries = 3
     for attempt in range(retries):
         try:
@@ -127,7 +123,7 @@ def _extract_structure(text_chunk, global_offset, model, safety_settings, prompt
             else:
                 debug_info.append({f"{step_name}_parsing_error": "응답이 유효한 JSON 리스트가 아닙니다."})
             
-            return extracted_nodes # 성공 시 루프 탈출
+            return extracted_nodes
         
         except InternalServerError as e:
             debug_info.append({f"{step_name}_retryable_error": f"Attempt {attempt + 1} failed: {e}"})
@@ -142,8 +138,8 @@ def _extract_structure(text_chunk, global_offset, model, safety_settings, prompt
 
 def run_pipeline(document_text, api_key, status_container, 
                  prompt_architect, prompt_surveyor, prompt_detailer,
-                 intermediate_callback=None):
-    """3단계 계층적 파이프라인을 실행합니다."""
+                 debug_info, intermediate_callback=None):
+    
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(MODEL_NAME)
     safety_settings = {
@@ -151,10 +147,8 @@ def run_pipeline(document_text, api_key, status_container,
         "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE", "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
     }
     
-    debug_info = []
     timings = {}
 
-    # === 1단계: Architect ===
     status_container.write(f"1/3: **Architect** - 최상위 구조 추출 중...")
     step1_start = time.perf_counter()
     top_level_nodes_raw = _extract_structure(
@@ -172,12 +166,11 @@ def run_pipeline(document_text, api_key, status_container,
     timings["step1_architect_duration"] = step1_end - step1_start
 
     if intermediate_callback:
-        intermediate_callback(top_level_nodes, status_container, debug_info)
+        intermediate_callback(top_level_nodes, status_container)
     
     if not final_tree:
-        return {"error": "1단계: 최상위 구조를 찾지 못했습니다."}, debug_info
+        return {"error": "1단계: 최상위 구조를 찾지 못했습니다."}
 
-    # === 2단계: Surveyor ===
     status_container.write(f"2/3: **Surveyor** - 중간 구조 추출 중...")
     step2_start = time.perf_counter()
     for i, parent_node in enumerate(final_tree):
@@ -193,7 +186,6 @@ def run_pipeline(document_text, api_key, status_container,
     step2_end = time.perf_counter()
     timings["step2_surveyor_duration"] = step2_end - step2_start
 
-    # === 3단계: Detailer ===
     status_container.write(f"3/3: **Detailer** - 최하위 구조 추출 중...")
     step3_start = time.perf_counter()
     queue = list(final_tree)
@@ -217,4 +209,4 @@ def run_pipeline(document_text, api_key, status_container,
     timings["step3_detailer_duration"] = step3_end - step3_start
     
     debug_info.append({"performance_timings": timings})
-    return {"tree": final_tree}, debug_info
+    return {"tree": final_tree}

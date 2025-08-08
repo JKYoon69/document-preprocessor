@@ -8,7 +8,6 @@ import time
 
 # --- Helper Functions ---
 def count_short_nodes(node, threshold, count=0):
-    """재귀적으로 트리를 순회하며 텍스트가 짧은 노드의 개수를 셉니다."""
     if len(node.get('text', '')) < threshold:
         count += 1
     for child in node.get('children', []):
@@ -22,28 +21,21 @@ if 'analysis_result' not in st.session_state:
     st.session_state.analysis_result = None
 
 # --- UI 레이아웃 ---
-st.title("🏛️ 태국 법률 문서 계층 분석기 (v3.2)")
+st.title("🏛️ 태국 법률 문서 계층 분석기 (v3.3)")
 st.markdown(f"**LLM Model:** `{dp.MODEL_NAME}` (수정은 `document_processor.py`에서 가능)")
 st.markdown("3단계 파이프라인과 자동 재시도, 성능 측정을 통해 법률 문서 구조를 분석합니다.")
 
 with st.expander("⚙️ 각 단계별 프롬프트 수정하기"):
     tab1, tab2, tab3 = st.tabs(["1단계: Architect", "2단계: Surveyor", "3단계: Detailer"])
-
     with tab1:
         st.info("문서 전체에서 최상위 구조(Book, Part, Chapter)를 찾는 임무를 정의합니다.")
-        st.session_state.prompt1 = st.text_area(
-            "Architect Prompt", value=dp.PROMPT_ARCHITECT, height=250
-        )
+        st.session_state.prompt1 = st.text_area("Architect Prompt", value=dp.PROMPT_ARCHITECT, height=250)
     with tab2:
         st.info("각 Chapter 내부에서 중간 구조(Section)를 찾는 임무를 정의합니다.")
-        st.session_state.prompt2 = st.text_area(
-            "Surveyor Prompt", value=dp.PROMPT_SURVEYOR, height=250
-        )
+        st.session_state.prompt2 = st.text_area("Surveyor Prompt", value=dp.PROMPT_SURVEYOR, height=250)
     with tab3:
         st.info("가장 작은 단위(Section 또는 Chapter) 내부에서 최하위 구조(Article)를 찾는 임무를 정의합니다.")
-        st.session_state.prompt3 = st.text_area(
-            "Detailer Prompt", value=dp.PROMPT_DETAILER, height=250
-        )
+        st.session_state.prompt3 = st.text_area("Detailer Prompt", value=dp.PROMPT_DETAILER, height=250)
 
 uploaded_file = st.file_uploader("분석할 태국 법률 텍스트 파일(.txt)을 업로드하세요.", type=['txt'])
 
@@ -54,15 +46,9 @@ if uploaded_file is not None:
 
     if st.button("계층 구조 분석 실행", type="primary"):
         st.session_state.analysis_result = None
-        
-        @st.cache_data
-        def get_debug_info_collector():
-            return []
-        
-        debug_info_collector = get_debug_info_collector()
-        debug_info_collector.clear()
+        debug_info = []
 
-        def display_intermediate_result(result, container, debug_info):
+        def display_intermediate_result(result, container):
             llm_duration = next((item.get('llm_duration_seconds', 0) for item in debug_info if "step1_architect_response" in item), 0)
             container.write(f"✅ 1단계 완료! (LLM 응답 시간: {llm_duration:.2f}초)")
             container.write("찾아낸 최상위 구조:")
@@ -72,13 +58,14 @@ if uploaded_file is not None:
         with st.status("3단계 분석 파이프라인을 시작합니다...", expanded=True) as status:
             try:
                 api_key = st.secrets["GEMINI_API_KEY"]
-                final_result, debug_info = dp.run_pipeline(
+                final_result = dp.run_pipeline(
                     document_text=document_text,
                     api_key=api_key,
                     status_container=status,
                     prompt_architect=st.session_state.prompt1,
                     prompt_surveyor=st.session_state.prompt2,
                     prompt_detailer=st.session_state.prompt3,
+                    debug_info=debug_info,
                     intermediate_callback=display_intermediate_result
                 )
                 
