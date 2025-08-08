@@ -22,7 +22,6 @@ if uploaded_file is not None:
         with st.status("전체 분석을 시작합니다...", expanded=True) as status:
             try:
                 api_key = st.secrets["GEMINI_API_KEY"]
-                # ✅✅✅ 호출하는 함수 이름을 'run_full_pipeline'으로 수정 ✅✅✅
                 final_json_result = document_processor.run_full_pipeline(
                     document_text=document_text, 
                     api_key=api_key,

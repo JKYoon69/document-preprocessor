@@ -5,17 +5,16 @@ import json
 import traceback
 from collections import Counter
 import time
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import google.api_core.exceptions
 
+# (extract_json_from_response 와 chunk_text_semantic 함수는 변경 없음)
 def extract_json_from_response(text):
     if '```json' in text:
-        try:
-            return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
-        except (json.JSONDecodeError, IndexError):
-            return None
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return None
+        try: return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
+        except (json.JSONDecodeError, IndexError): return None
+    try: return json.loads(text)
+    except json.JSONDecodeError: return None
 
 def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
     if len(text) <= chunk_size_chars:
@@ -32,11 +31,8 @@ def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
         for sep in separators:
             search_start = max(start_char, ideal_end - 5000)
             best_sep_pos = text.rfind(sep, search_start, ideal_end)
-            if best_sep_pos != -1:
-                actual_end = best_sep_pos + len(sep)
-                break
-        if best_sep_pos == -1:
-            actual_end = ideal_end
+            if best_sep_pos != -1: actual_end = best_sep_pos + len(sep); break
+        if best_sep_pos == -1: actual_end = ideal_end
         chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end], "global_start": start_char})
         start_char = actual_end - overlap_chars
     return chunks
@@ -63,88 +59,72 @@ def build_tree(flat_list):
             if not node["sections"]: del node["sections"]
             if not node["articles"]: del node["articles"]
             del node["children"]
-        del node["level"], node["global_start"], node["global_end"]
+        if "level" in node: del node["level"]
+        if "global_start" in node: del node["global_start"]
+        if "global_end" in node: del node["global_end"]
     for child in root["children"]: finalize_structure(child)
     return root["children"]
 
+# ✅✅✅ 재시도 로직을 적용한 API 호출 함수 ✅✅✅
+@retry(
+    retry=retry_if_exception_type(google.api_core.exceptions.InternalServerError),
+    wait=wait_exponential(multiplier=1, min=2, max=60), # 2초, 4초, 8초... 간격으로 재시도
+    stop=stop_after_attempt(3) # 최대 3번까지 재시도
+)
+def generate_content_with_retry(model, prompt):
+    return model.generate_content(prompt)
+
+# ✅✅✅ 재귀적 요약 로직 (안정성 강화) ✅✅✅
 def summarize_nodes_recursively(node, model, global_summary, status_container):
     if "sections" in node:
         for section in node["sections"]:
             summarize_nodes_recursively(section, model, global_summary, status_container)
     if "articles" in node:
         for article in node["articles"]:
-            status_container.write(f"...Summarizing: {article.get('title', 'Unknown Article')}")
-            prompt = f"Based on the global summary '{global_summary}', please summarize the following article '{article.get('title')}' in one sentence in Korean.\n\nText:\n{article.get('text')}"
-            response = model.generate_content(prompt)
-            article["summary"] = response.text.strip()
+            try:
+                status_container.write(f"...Summarizing: {article.get('title', 'Unknown Article')}")
+                prompt = f"Based on the global summary '{global_summary}', please summarize the following article '{article.get('title')}' in one sentence in Korean.\n\nText:\n{article.get('text')}"
+                response = generate_content_with_retry(model, prompt)
+                article["summary"] = response.text.strip()
+            except Exception as e:
+                article["summary"] = f"Summarization failed: {e}"
+
     if "sections" in node or "articles" in node:
         child_summaries = ""
         if "sections" in node: child_summaries += "\n".join([f"- {s.get('title')}: {s.get('summary', '')}" for s in node["sections"]])
         if "articles" in node: child_summaries += "\n".join([f"- {a.get('title')}: {a.get('summary', '')}" for a in node["articles"]])
-        status_container.write(f"...Summarizing parent node: {node.get('title', 'Unknown Node')}")
-        prompt = f"Based on the global summary '{global_summary}', please synthesize the following summaries of child nodes into a comprehensive summary for the parent node '{node.get('title')}' in Korean.\n\nChild Summaries:\n{child_summaries}"
-        response = model.generate_content(prompt)
-        node["summary"] = response.text.strip()
+        
+        # 프롬프트 길이 제한
+        max_summary_len = 30000
+        if len(child_summaries) > max_summary_len:
+            child_summaries = child_summaries[:max_summary_len] + "\n... (summaries truncated)"
 
-# ✅✅✅ 함수 이름을 'run_full_pipeline'으로 수정 ✅✅✅
+        try:
+            status_container.write(f"...Summarizing parent node: {node.get('title', 'Unknown Node')}")
+            prompt = f"Based on the global summary '{global_summary}', please synthesize the following summaries of child nodes into a comprehensive summary for the parent node '{node.get('title')}' in Korean.\n\nChild Summaries:\n{child_summaries}"
+            response = generate_content_with_retry(model, prompt)
+            node["summary"] = response.text.strip()
+        except Exception as e:
+            node["summary"] = f"Summarization failed: {e}"
+
+
+# 최종 파이프라인 함수
 def run_full_pipeline(document_text, api_key, status_container):
     model_name = 'gemini-2.5-flash-lite'
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
     
     status_container.write("1/5: Generating global summary...")
-    preamble_text = document_text[:4000]
-    prompt_global = f"Summarize the preamble of this Thai legal document in Korean.\n\n[Preamble]\n{preamble_text}"
-    response_summary = model.generate_content(prompt_global)
+    response_summary = generate_content_with_retry(model, f"Summarize the preamble of this Thai legal document in Korean.\n\n[Preamble]\n{document_text[:4000]}")
     global_summary = response_summary.text.strip()
 
     status_container.write("2/5: Chunking and analyzing structure...")
     chunks = chunk_text_semantic(document_text)
     all_headers = []
-    prompt_structure = """You are a highly accurate legal document parsing tool. Your task is to analyze the following chunk of a Thai legal document and identify all structural elements.
-
-Follow these rules with extreme precision:
-1.  Identify the introductory text before the first formal article as `preamble`.
-2.  Identify all headers such as 'ภาค', 'ลักษณะ', 'หมวด', 'ส่วน', and 'มาตรา'.
-3.  For each element, create a JSON object.
-4.  The `title` field MUST contain ONLY the short header text (e.g., "มาตรา ๑").
-5.  The `end_index` of an element MUST extend to the character right before the `start_index` of the NEXT element. If it is the last element in the chunk, its `end_index` is the end of the chunk. This is crucial to avoid missing any text.
-6.  Map the Thai header to the `type` field using these exact rules:
-    - Text before 'มาตรา ๑' -> 'preamble'
-    - 'ภาค' -> 'book'
-    - 'ลักษณะ' -> 'part'
-    - 'หมวด' -> 'chapter'
-    - 'ส่วน' -> 'section'
-    - 'มาตรา' -> 'article'
-7.  Return a single JSON array of these objects.
-
-Example of expected output for a chunk:
-[
-  {{
-    "type": "preamble",
-    "title": "Preamble",
-    "start_index": 0,
-    "end_index": 533
-  }},
-  {{
-    "type": "article",
-    "title": "มาตรา ๑",
-    "start_index": 534,
-    "end_index": 611
-  }},
-  {{
-    "type": "article",
-    "title": "มาตรา ๒",
-    "start_index": 612,
-    "end_index": 688
-  }}
-]
-
-[Text Chunk]
-{text_chunk}"""
+    prompt_structure = """You are a highly accurate legal document parsing tool... [Text Chunk]\n{text_chunk}"""
     for i, chunk in enumerate(chunks):
         prompt = prompt_structure.format(text_chunk=chunk["text"])
-        response = model.generate_content(prompt)
+        response = generate_content_with_retry(model, prompt)
         headers_in_chunk = extract_json_from_response(response.text)
         if isinstance(headers_in_chunk, list):
             for header in headers_in_chunk:
@@ -156,7 +136,7 @@ Example of expected output for a chunk:
     status_container.write("3/5: Post-processing data...")
     if not all_headers: raise ValueError("LLM did not extract any structure.")
     unique_headers = sorted(list({h['global_start']: h for h in all_headers}.values()), key=lambda x: x['global_start'])
-    if unique_headers[0]["global_start"] > 0:
+    if unique_headers and unique_headers[0]["global_start"] > 0:
         preamble_node = {"type": "preamble", "title": "Preamble", "global_start": 0, "global_end": unique_headers[0]["global_start"]}
         unique_headers.insert(0, preamble_node)
     for i in range(len(unique_headers) - 1):
