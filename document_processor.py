@@ -20,17 +20,13 @@ def extract_json_from_response(text):
 def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
     if len(text) <= chunk_size_chars:
         return [{"start_char": 0, "end_char": len(text), "text": text, "global_start": 0}]
-
-    chunks = []
-    start_char = 0
+    chunks, start_char = [], 0
     while start_char < len(text):
         ideal_end = start_char + chunk_size_chars
         actual_end = min(ideal_end, len(text))
-        
         if ideal_end >= len(text):
             chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end], "global_start": start_char})
             break
-
         separators = ["\n\n", ". ", " ", ""]
         best_sep_pos = -1
         for sep in separators:
@@ -41,7 +37,6 @@ def chunk_text_semantic(text, chunk_size_chars=100000, overlap_chars=20000):
                 break
         if best_sep_pos == -1:
             actual_end = ideal_end
-
         chunks.append({"start_char": start_char, "end_char": actual_end, "text": text[start_char:actual_end], "global_start": start_char})
         start_char = actual_end - overlap_chars
     return chunks
@@ -60,7 +55,6 @@ def build_tree(flat_list):
         if "children" not in parent: parent["children"] = []
         parent["children"].append(node)
         if node["level"] < 4: stack.append(node)
-            
     def finalize_structure(node):
         if "children" in node:
             node["sections"] = [child for child in node["children"] if child.get("level") < 4]
@@ -72,9 +66,7 @@ def build_tree(flat_list):
         if "level" in node: del node["level"]
         if "global_start" in node: del node["global_start"]
         if "global_end" in node: del node["global_end"]
-        
-    for child in root["children"]:
-        finalize_structure(child)
+    for child in root["children"]: finalize_structure(child)
     return root["children"]
 
 def summarize_nodes_recursively(node, model, global_summary, status_container):
@@ -96,7 +88,7 @@ def summarize_nodes_recursively(node, model, global_summary, status_container):
         response = model.generate_content(prompt)
         node["summary"] = response.text.strip()
 
-# ✅✅✅ 함수 정의에 'file_name' 인자 추가 ✅✅✅
+# ✅✅✅ 함수 정의에 'file_name' 인자를 추가했습니다 ✅✅✅
 def run_final_pipeline(document_text, api_key, status_container, file_name):
     model_name = 'gemini-2.5-flash'
     genai.configure(api_key=api_key)
@@ -185,6 +177,6 @@ Example of expected output for a chunk:
 
     return {
         "global_summary": global_summary,
-        "document_title": file_name.split('.')[0], # ✅ 'file_name' 인자 사용
+        "document_title": file_name.split('.')[0],
         "chapters": hierarchical_tree
     }

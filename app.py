@@ -22,7 +22,7 @@ if uploaded_file is not None:
         with st.status("전체 분석을 시작합니다...", expanded=True) as status:
             try:
                 api_key = st.secrets["GEMINI_API_KEY"]
-                # ✅✅✅ 'uploaded_file' 대신 'file_name'으로 파일 이름을 전달 ✅✅✅
+                # ✅✅✅ 'file_name' 인자를 정확히 전달합니다 ✅✅✅
                 final_json_result = document_processor.run_final_pipeline(
                     document_text=document_text, 
                     api_key=api_key,
