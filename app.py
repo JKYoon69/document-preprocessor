@@ -21,9 +21,9 @@ if 'analysis_result' not in st.session_state:
     st.session_state.analysis_result = None
 
 # --- UI 레이아웃 ---
-st.title("🏛️ 태국 법률 문서 계층 분석기 (v3.3)")
+st.title("🏛️ 태국 법률 문서 계층 분석기 (v3.4)")
 st.markdown(f"**LLM Model:** `{dp.MODEL_NAME}` (수정은 `document_processor.py`에서 가능)")
-st.markdown("3단계 파이프라인과 자동 재시도, 성능 측정을 통해 법률 문서 구조를 분석합니다.")
+st.markdown("3단계 파이프라인, 자동 재시도, 성능 측정, 최종 노드 버그 수정 및 UI 개선 적용")
 
 with st.expander("⚙️ 각 단계별 프롬프트 수정하기"):
     tab1, tab2, tab3 = st.tabs(["1단계: Architect", "2단계: Surveyor", "3단계: Detailer"])
@@ -42,7 +42,7 @@ uploaded_file = st.file_uploader("분석할 태국 법률 텍스트 파일(.txt)
 if uploaded_file is not None:
     document_text = uploaded_file.getvalue().decode('utf-8')
     char_count = len(document_text)
-    st.info(f"📁 업로드된 파일: **{uploaded_file.name}** | 총 글자 수: **{char_count:,}** 자")
+    st.info(f"📁 **{uploaded_file.name}** | 총 글자 수: **{char_count:,}** 자")
 
     if st.button("계층 구조 분석 실행", type="primary"):
         st.session_state.analysis_result = None
@@ -59,21 +59,13 @@ if uploaded_file is not None:
             try:
                 api_key = st.secrets["GEMINI_API_KEY"]
                 final_result = dp.run_pipeline(
-                    document_text=document_text,
-                    api_key=api_key,
-                    status_container=status,
-                    prompt_architect=st.session_state.prompt1,
-                    prompt_surveyor=st.session_state.prompt2,
-                    prompt_detailer=st.session_state.prompt3,
-                    debug_info=debug_info,
+                    document_text=document_text, api_key=api_key, status_container=status,
+                    prompt_architect=st.session_state.prompt1, prompt_surveyor=st.session_state.prompt2,
+                    prompt_detailer=st.session_state.prompt3, debug_info=debug_info,
                     intermediate_callback=display_intermediate_result
                 )
                 
-                st.session_state.analysis_result = {
-                    "final": final_result,
-                    "debug": debug_info,
-                    "file_name": uploaded_file.name
-                }
+                st.session_state.analysis_result = { "final": final_result, "debug": debug_info, "file_name": uploaded_file.name }
                 status.update(label="✅ 계층 분석 완료!", state="complete", expanded=False)
                 st.success("🎉 성공적으로 계층 트리 구조를 생성했습니다!")
                 time.sleep(0.5)
@@ -115,6 +107,15 @@ if st.session_state.analysis_result:
     tab1, tab2 = st.tabs(["✔️ 최종 결과 (계층 트리)", "🐞 상세 디버그 로그"])
 
     with tab1:
+        # [수정] JSON 출력창에 스크롤 기능 추가
+        st.markdown("""
+            <style>
+                .stJson > div {
+                    max-height: 600px;
+                    overflow-y: auto;
+                }
+            </style>
+        """, unsafe_allow_html=True)
         st.json(final_result_data, expanded=True)
         st.download_button(
            label="결과 트리 (JSON) 다운로드",
@@ -124,7 +125,6 @@ if st.session_state.analysis_result:
         )
 
     with tab2:
-        st.write("파이프라인 각 단계에서 LLM이 반환한 원본 데이터 등 상세한 로그를 포함합니다.")
         st.json({"pipeline_logs": debug_info}, expanded=False)
         st.download_button(
            label="디버그 로그 (JSON) 다운로드",

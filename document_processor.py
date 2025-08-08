@@ -6,46 +6,41 @@ import time
 from google.api_core.exceptions import InternalServerError
 
 # ==============================================================================
-# [ CONFIGURATION ] - 모델명과 프롬프트를 이곳에서 쉽게 수정하세요.
+# [ CONFIGURATION ]
 # ==============================================================================
 MODEL_NAME = "gemini-2.5-flash"
+DETAIL_CHUNK_SIZE_THRESHOLD = 30000  # 3단계(Detailer)에서 이 글자 수를 넘으면 내부적으로 청킹 수행
 
 TYPE_MAPPING = {
-    "ภาค": "book",
-    "ลักษณะ": "part",
-    "หมวด": "chapter",
-    "ส่วน": "section",
-    "มาตรา": "article"
+    "ภาค": "book", "ลักษณะ": "part", "หมวด": "chapter",
+    "ส่วน": "section", "มาตรา": "article"
 }
 
 PROMPT_ARCHITECT = """You are a top-level document architect for Thai legal codes. Your mission is to identify ONLY the highest-level structural blocks.
-
-1.  Analyze the entire document text provided.
-2.  Identify all headers for 'ภาค' (book), 'ลักษณะ' (part), and 'หมวด' (chapter).
-3.  **STRICTLY IGNORE** all lower-level headers like 'ส่วน' (section) and 'มาตรา' (article). Do not include them in your output.
-4.  For each header found, create a JSON object with `type`, `title`, and its `start_index` within the full text.
-5.  Return a single, flat JSON array of these objects. If no headers are found, return an empty array `[]`.
+1. Analyze the entire document text provided.
+2. Identify all headers for 'ภาค' (book), 'ลักษณะ' (part), and 'หมวด' (chapter).
+3. **STRICTLY IGNORE** all lower-level headers like 'ส่วน' (section) and 'มาตรา' (article).
+4. For each header found, create a JSON object with `type`, `title`, and its `start_index`.
+5. Return a single, flat JSON array of these objects. If no headers are found, return an empty array `[]`.
 
 [DOCUMENT TEXT]
 {text_chunk}"""
 
 PROMPT_SURVEYOR = """You are a structural surveyor for a Thai legal chapter. Your mission is to map out the mid-level 'section' blocks within a given chapter.
-
-1.  Analyze the provided text, which is a single chapter from a legal document.
-2.  Identify all headers for 'ส่วน' (section).
-3.  **STRICTLY IGNORE** 'มาตรา' (article) headers.
-4.  For each 'ส่วน' (section) header found, create a JSON object with `type`: "section", `title`, and its `start_index` within the provided text.
-5.  Return a single, flat JSON array of these objects. If no sections are found, return an empty array `[]`.
+1. Analyze the provided text, which is a single chapter from a legal document.
+2. Identify all headers for 'ส่วน' (section).
+3. **STRICTLY IGNORE** 'มาตรา' (article) headers.
+4. For each 'ส่วน' (section) header found, create a JSON object with `type`: "section", `title`, and its `start_index`.
+5. Return a single, flat JSON array of these objects. If no sections are found, return an empty array `[]`.
 
 [CHAPTER TEXT]
 {text_chunk}"""
 
 PROMPT_DETAILER = """You are a meticulous clerk for a Thai legal section. Your mission is to find and list all 'article' blocks.
-
-1.  Analyze the provided text, which is a single section or chapter from a legal document.
-2.  Identify all headers for 'มาตรา' (article).
-3.  For each 'มาตรา' (article) header found, create a JSON object with `type`: "article", `title`, and its `start_index` within the provided text.
-4.  Return a single, flat JSON array of these objects. If no articles are found, return an empty array `[]`.
+1. Analyze the provided text, which is a single section or chapter from a legal document.
+2. Identify all headers for 'มาตรา' (article).
+3. For each 'มาตรา' (article) header found, create a JSON object with `type`: "article", `title`, and its `start_index`.
+4. Return a single, flat JSON array of these objects. If no articles are found, return an empty array `[]`.
 
 [SECTION/CHAPTER TEXT]
 {text_chunk}"""
@@ -67,20 +62,38 @@ def extract_json_from_response(text):
     except json.JSONDecodeError:
         return None
 
+def chunk_text_semantic(text, chunk_size_chars=30000, overlap_chars=3000):
+    if len(text) <= chunk_size_chars:
+        return [{"start_char": 0, "text": text}]
+
+    chunks = []
+    start_char = 0
+    while start_char < len(text):
+        ideal_end = start_char + chunk_size_chars
+        if ideal_end >= len(text):
+            chunks.append({"start_char": start_char, "text": text[start_char:]})
+            break
+
+        separators = ["\n\n", ". ", " ", ""]
+        actual_end = -1
+        for sep in separators:
+            actual_end = text.rfind(sep, start_char, ideal_end)
+            if actual_end != -1:
+                break
+        
+        actual_end = ideal_end if actual_end == -1 else actual_end + len(sep)
+        chunks.append({"start_char": start_char, "text": text[start_char:actual_end]})
+        start_char = actual_end - overlap_chars
+    return chunks
+
 def postprocess_nodes(nodes, parent_text, global_offset=0):
     if not nodes:
         return []
 
     parent_end = global_offset + len(parent_text)
-    scoped_nodes = [
-        node for node in nodes 
-        if 'global_start' in node and global_offset <= node['global_start'] < parent_end
-    ]
-
-    unique_nodes = sorted(
-        list({node['global_start']: node for node in scoped_nodes}.values()),
-        key=lambda x: x['global_start']
-    )
+    scoped_nodes = [node for node in nodes if 'global_start' in node and global_offset <= node['global_start'] < parent_end]
+    
+    unique_nodes = sorted(list({node['global_start']: node for node in scoped_nodes}.values()), key=lambda x: x['global_start'])
 
     for i in range(len(unique_nodes) - 1):
         unique_nodes[i]['global_end'] = unique_nodes[i+1]['global_start']
@@ -142,31 +155,24 @@ def run_pipeline(document_text, api_key, status_container,
     
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(MODEL_NAME)
-    safety_settings = {
-        "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE", "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-        "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE", "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
-    }
+    safety_settings = { "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE", "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
+                      "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE", "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE" }
     
     timings = {}
 
     status_container.write(f"1/3: **Architect** - 최상위 구조 추출 중...")
     step1_start = time.perf_counter()
-    top_level_nodes_raw = _extract_structure(
-        document_text, 0, model, safety_settings, 
-        prompt_architect, debug_info, "step1_architect"
-    )
+    top_level_nodes_raw = _extract_structure(document_text, 0, model, safety_settings, prompt_architect, debug_info, "step1_architect")
     
     if not top_level_nodes_raw or top_level_nodes_raw[0].get('global_start', 0) > 0:
-        preamble_node = {'type': 'preamble', 'title': 'Preamble', 'global_start': 0}
-        top_level_nodes_raw.insert(0, preamble_node)
+        top_level_nodes_raw.insert(0, {'type': 'preamble', 'title': 'Preamble', 'global_start': 0})
     
-    top_level_nodes = postprocess_nodes(top_level_nodes_raw, document_text, 0)
-    final_tree = top_level_nodes
+    final_tree = postprocess_nodes(top_level_nodes_raw, document_text, 0)
     step1_end = time.perf_counter()
     timings["step1_architect_duration"] = step1_end - step1_start
 
     if intermediate_callback:
-        intermediate_callback(top_level_nodes, status_container)
+        intermediate_callback(final_tree, status_container)
     
     if not final_tree:
         return {"error": "1단계: 최상위 구조를 찾지 못했습니다."}
@@ -174,37 +180,46 @@ def run_pipeline(document_text, api_key, status_container,
     status_container.write(f"2/3: **Surveyor** - 중간 구조 추출 중...")
     step2_start = time.perf_counter()
     for i, parent_node in enumerate(final_tree):
-        if not parent_node.get('text', '').strip() or parent_node['type'] == 'preamble':
-            continue
-        
-        mid_level_nodes_raw = _extract_structure(
-            parent_node['text'], parent_node['global_start'], model, safety_settings,
-            prompt_surveyor, debug_info, f"step2_surveyor_parent_{i+1}"
-        )
-        mid_level_nodes = postprocess_nodes(mid_level_nodes_raw, parent_node['text'], parent_node['global_start'])
-        parent_node['children'] = mid_level_nodes
+        if not parent_node.get('text', '').strip() or parent_node['type'] == 'preamble': continue
+        mid_level_nodes_raw = _extract_structure(parent_node['text'], parent_node['global_start'], model, safety_settings, prompt_surveyor, debug_info, f"step2_surveyor_parent_{i+1}")
+        parent_node['children'] = postprocess_nodes(mid_level_nodes_raw, parent_node['text'], parent_node['global_start'])
     step2_end = time.perf_counter()
     timings["step2_surveyor_duration"] = step2_end - step2_start
 
     status_container.write(f"3/3: **Detailer** - 최하위 구조 추출 중...")
     step3_start = time.perf_counter()
-    queue = list(final_tree)
-    while queue:
-        current_node = queue.pop(0)
-        
-        if current_node.get('children'):
-            queue.extend(current_node['children'])
-            continue
+    
+    # [수정] 재귀 함수를 이용한 견고한 하위 노드 탐색 로직
+    def process_recursively(nodes):
+        for i, node in enumerate(nodes):
+            if not node.get('text', '').strip() or node['type'] in ['preamble', 'article']:
+                continue
 
-        if not current_node.get('text', '').strip() or current_node['type'] in ['preamble', 'article']:
-            continue
+            # 자식이 이미 있으면 자식에 대해 재귀 호출
+            if node.get('children'):
+                process_recursively(node['children'])
+            else: # 자식이 없으면 Detailer 실행
+                all_articles_raw = []
+                node_text = node['text']
+                node_offset = node['global_start']
+                
+                # [수정] 성능 최적화: 큰 텍스트는 내부적으로 청킹
+                if len(node_text) > DETAIL_CHUNK_SIZE_THRESHOLD:
+                    sub_chunks = chunk_text_semantic(node_text)
+                else:
+                    sub_chunks = [{'start_char': 0, 'text': node_text}]
+                
+                for j, sub_chunk in enumerate(sub_chunks):
+                    chunk_offset = node_offset + sub_chunk['start_char']
+                    articles_in_chunk = _extract_structure(
+                        sub_chunk['text'], chunk_offset, model, safety_settings, prompt_detailer, 
+                        debug_info, f"step3_detailer_parent_{i+1}_subchunk_{j+1}"
+                    )
+                    all_articles_raw.extend(articles_in_chunk)
 
-        low_level_nodes_raw = _extract_structure(
-            current_node['text'], current_node['global_start'], model, safety_settings,
-            prompt_detailer, debug_info, f"step3_detailer_parent_{current_node.get('title', 'node')[:20]}"
-        )
-        low_level_nodes = postprocess_nodes(low_level_nodes_raw, current_node['text'], current_node['global_start'])
-        current_node['children'] = low_level_nodes
+                node['children'] = postprocess_nodes(all_articles_raw, node_text, node_offset)
+
+    process_recursively(final_tree)
     step3_end = time.perf_counter()
     timings["step3_detailer_duration"] = step3_end - step3_start
     
