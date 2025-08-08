@@ -23,7 +23,7 @@ if 'debug_info' not in st.session_state:
     st.session_state.debug_info = []
 
 # --- UI Layout ---
-st.title("🏛️ Thai Legal Document Parser (v4.0)")
+st.title("🏛️ Thai Legal Document Parser (v4.1)")
 st.markdown(f"**LLM Model:** `{dp.MODEL_NAME}` (Configurable in `document_processor.py`)")
 st.markdown("Analyzes the hierarchical structure of Thai legal documents using a 3-step pipeline with auto-retry and performance monitoring.")
 
@@ -48,7 +48,7 @@ if uploaded_file is not None:
 
     if st.button("Run Hierarchical Analysis", type="primary"):
         st.session_state.analysis_result = None
-        st.session_state.debug_info = []
+        st.session_state.debug_info.clear()
 
         def display_intermediate_result(result):
             status_container = st.session_state.get('status_container')
@@ -58,7 +58,8 @@ if uploaded_file is not None:
             status_container.write(f"✅ Step 1 Complete! (LLM call: {llm_duration:.2f}s)")
             status_container.write("Found top-level structures:")
             display_data = [{"type": n.get('type'), "title": n.get('title')} for n in result]
-            status_container.dataframe(display_data)
+            container = st.empty()
+            container.dataframe(display_data)
 
         with st.status("Running 3-step analysis pipeline...", expanded=True) as status:
             st.session_state['status_container'] = status
