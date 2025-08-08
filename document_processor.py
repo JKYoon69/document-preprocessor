@@ -8,7 +8,7 @@ from google.api_core.exceptions import InternalServerError
 # ==============================================================================
 # [ CONFIGURATION ] - 모델명과 프롬프트를 이곳에서 쉽게 수정하세요.
 # ==============================================================================
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-2.5-flash"
 
 TYPE_MAPPING = {
     "ภาค": "book",
