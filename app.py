@@ -3,11 +3,10 @@
 import streamlit as st
 import document_processor
 import json
-import pandas as pd
 import traceback
 
 st.set_page_config(page_title="구조 분석 안정화", page_icon="🛡️", layout="wide")
-st.title("🛡️ 구조 분석 안정화 테스트 (v2.1)")
+st.title("🛡️ 구조 분석 안정화 테스트 (v2.2)")
 st.write("LLM 기반 구조 추출의 안정성을 검증하고, LLM의 원본 응답을 상세히 추적합니다.")
 
 if 'analysis_result' not in st.session_state:
@@ -23,6 +22,7 @@ if uploaded_file is not None:
         with st.status("분석을 시작합니다...", expanded=True) as status:
             try:
                 api_key = st.secrets["GEMINI_API_KEY"]
+                # ✅ document_processor.py에 정의된 함수 이름과 정확히 일치합니다.
                 final_result, debug_info = document_processor.run_extraction_pipeline(
                     document_text=document_text, 
                     api_key=api_key,
