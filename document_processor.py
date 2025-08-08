@@ -3,7 +3,10 @@ import google.generativeai as genai
 import json
 import traceback
 
-# --- 기본 프롬프트 정의 ---
+# ==============================================================================
+# [ CONFIGURATION ] - 모델명과 프롬프트를 이곳에서 쉽게 수정하세요.
+# ==============================================================================
+MODEL_NAME = "gemini-2.5-flash"
 
 PROMPT_ARCHITECT = """You are a top-level document architect for Thai legal codes. Your mission is to identify ONLY the highest-level structural blocks.
 
@@ -36,12 +39,14 @@ PROMPT_DETAILER = """You are a meticulous clerk for a Thai legal section. Your m
 
 [SECTION/CHAPTER TEXT]
 {text_chunk}"""
+# ==============================================================================
+# [ END OF CONFIGURATION ]
+# ==============================================================================
 
 
 # --- Helper Functions ---
 
 def extract_json_from_response(text):
-    """LLM 응답에서 JSON 코드 블록을 안전하게 추출합니다."""
     if '```json' in text:
         try:
             return json.loads(text.split('```json', 1)[1].split('```', 1)[0].strip())
@@ -53,7 +58,6 @@ def extract_json_from_response(text):
         return None
 
 def postprocess_nodes(nodes, parent_text, global_offset=0):
-    """노드 리스트를 후처리하여 인덱스를 보정하고 텍스트를 채웁니다."""
     if not nodes:
         return []
 
@@ -85,7 +89,6 @@ def postprocess_nodes(nodes, parent_text, global_offset=0):
 # --- Core Extraction Logic ---
 
 def _extract_structure(text_chunk, global_offset, model, safety_settings, prompt_template, debug_info, step_name):
-    """지정된 프롬프트를 사용하여 텍스트 청크에서 구조를 추출하는 범용 함수"""
     extracted_nodes = []
     try:
         prompt = prompt_template.format(text_chunk=text_chunk)
@@ -111,10 +114,9 @@ def _extract_structure(text_chunk, global_offset, model, safety_settings, prompt
 
 def run_pipeline(document_text, api_key, status_container, 
                  prompt_architect, prompt_surveyor, prompt_detailer):
-    """3단계 계층적 파이프라인 실행"""
-    model_name = 'gemini-2.5-flash'
+    
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
+    model = genai.GenerativeModel(MODEL_NAME) # 설정 섹션의 모델명 사용
     safety_settings = {
         "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE", "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
         "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE", "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
@@ -123,7 +125,7 @@ def run_pipeline(document_text, api_key, status_container,
     debug_info = []
 
     # === 1단계: 최상위 구조 (Architect) ===
-    status_container.write(f"1/3: **Architect** - 문서 전체에서 최상위 구조(Book, Part, Chapter)를 추출합니다...")
+    status_container.write(f"1/3: **Architect** - 문서 전체에서 최상위 구조를 추출합니다...")
     top_level_nodes_raw = _extract_structure(
         document_text, 0, model, safety_settings, 
         prompt_architect, debug_info, "step1_architect"
@@ -140,9 +142,8 @@ def run_pipeline(document_text, api_key, status_container,
         return {"error": "1단계: 최상위 구조를 찾지 못했습니다."}, debug_info
 
     # === 2단계: 중간 구조 (Surveyor) ===
-    status_container.write(f"2/3: **Surveyor** - {len(final_tree)}개의 최상위 구조 내부에서 중간 구조(Section)를 추출합니다...")
+    status_container.write(f"2/3: **Surveyor** - {len(final_tree)}개 최상위 구조 내부에서 중간 구조를 추출합니다...")
     for i, parent_node in enumerate(final_tree):
-        # Preamble 같이 하위 구조가 없는 노드는 건너뜀
         if not parent_node.get('text', '').strip() or parent_node['type'] == 'preamble':
             continue
         
@@ -154,22 +155,21 @@ def run_pipeline(document_text, api_key, status_container,
         parent_node['children'] = mid_level_nodes
 
     # === 3단계: 최하위 구조 (Detailer) ===
-    status_container.write(f"3/3: **Detailer** - 하위 구조(Article)를 추출하여 최종 트리를 완성합니다...")
+    status_container.write(f"3/3: **Detailer** - 하위 구조를 추출하여 최종 트리를 완성합니다...")
     nodes_to_traverse = list(final_tree)
-    while nodes_to_traverse:
-        current_node = nodes_to_traverse.pop(0)
-        
-        # Section이 있으면 Section 내부에서 Article을 찾고, 없으면 Chapter 등에서 바로 Article을 찾음
+    queue = list(final_tree)
+    while queue:
+        current_node = queue.pop(0)
         if current_node.get('children'):
-            nodes_to_traverse.extend(current_node['children'])
+            queue.extend(current_node['children'])
             continue
 
-        if not current_node.get('text', '').strip() or current_node['type'] == 'preamble':
+        if not current_node.get('text', '').strip() or current_node['type'] in ['preamble', 'article']:
             continue
 
         low_level_nodes_raw = _extract_structure(
             current_node['text'], current_node['global_start'], model, safety_settings,
-            prompt_detailer, debug_info, f"step3_detailer_parent_{current_node['title']}"
+            prompt_detailer, debug_info, f"step3_detailer_parent_{current_node.get('title', 'node')}"
         )
         low_level_nodes = postprocess_nodes(low_level_nodes_raw, current_node['text'], current_node['global_start'])
         current_node['children'] = low_level_nodes

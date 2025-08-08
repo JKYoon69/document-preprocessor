@@ -14,6 +14,7 @@ if 'analysis_result' not in st.session_state:
 
 # --- UI 레이아웃 ---
 st.title("🏛️ 태국 법률 문서 계층 분석기 (3-Step Pipeline Ver.)")
+st.markdown(f"**LLM Model:** `{dp.MODEL_NAME}` (수정은 `document_processor.py`에서 가능)")
 st.markdown("LLM에 대한 3단계 순차적 임무 부여를 통해 법률 문서의 계층 구조를 정밀하게 분석합니다.")
 
 # --- 프롬프트 수정 UI ---
@@ -36,7 +37,6 @@ with st.expander("⚙️ 각 단계별 프롬프트 수정하기"):
             "Detailer Prompt", value=dp.PROMPT_DETAILER, height=300, key="prompt3"
         )
 
-
 uploaded_file = st.file_uploader("분석할 태국 법률 텍스트 파일(.txt)을 업로드하세요.", type=['txt'])
 
 if uploaded_file is not None:
@@ -47,7 +47,6 @@ if uploaded_file is not None:
         with st.status("3단계 분석 파이프라인을 시작합니다...", expanded=True) as status:
             try:
                 api_key = st.secrets["GEMINI_API_KEY"]
-                # 수정된 프롬프트를 인자로 전달
                 final_result, debug_info = dp.run_pipeline(
                     document_text=document_text,
                     api_key=api_key,
