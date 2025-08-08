@@ -22,7 +22,8 @@ if uploaded_file is not None:
         with st.status("전체 분석을 시작합니다...", expanded=True) as status:
             try:
                 api_key = st.secrets["GEMINI_API_KEY"]
-                final_json_result = document_processor.run_final_pipeline(
+                # ✅✅✅ 호출하는 함수 이름을 'run_full_pipeline'으로 수정 ✅✅✅
+                final_json_result = document_processor.run_full_pipeline(
                     document_text=document_text, 
                     api_key=api_key,
                     status_container=status
@@ -40,7 +41,6 @@ if uploaded_file is not None:
                 st.error(f"처리 중 예상치 못한 오류가 발생했습니다: {e}")
                 st.code(traceback.format_exc())
 
-# session_state에 결과가 있으면 화면에 표시합니다.
 if st.session_state.final_result:
     result = st.session_state.final_result["data"]
     file_name = st.session_state.final_result["file_name"]
