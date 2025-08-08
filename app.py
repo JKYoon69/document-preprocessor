@@ -5,71 +5,54 @@ import document_processor
 import json
 import traceback
 
-st.set_page_config(page_title="구조 분석 안정화", page_icon="🛡️", layout="wide")
-st.title("🛡️ 구조 분석 안정화 테스트 (v2.2)")
-st.write("LLM 기반 구조 추출의 안정성을 검증하고, LLM의 원본 응답을 상세히 추적합니다.")
+st.set_page_config(page_title="RAG Pre-processor", page_icon="⚖️", layout="wide")
+st.title("⚖️ Thai Legal Document RAG Pre-processor")
+st.write("This tool analyzes a Thai legal document, builds a hierarchical structure, and generates summaries for each section, creating a final JSON output for a RAG system.")
 
-if 'analysis_result' not in st.session_state:
-    st.session_state.analysis_result = None
+if 'final_result' not in st.session_state:
+    st.session_state.final_result = None
 
-uploaded_file = st.file_uploader("법률 파일을 선택하세요.", type=['txt'])
+uploaded_file = st.file_uploader("Upload a Thai legal .txt file", type=['txt'])
 
 if uploaded_file is not None:
-    if st.button("구조 추출 실행"):
+    if st.button("Begin Full Analysis"):
+        st.session_state.final_result = None
         document_text = uploaded_file.getvalue().decode('utf-8')
-        st.session_state.analysis_result = None
         
-        with st.status("분석을 시작합니다...", expanded=True) as status:
+        with st.status("Running full analysis pipeline...", expanded=True) as status:
             try:
                 api_key = st.secrets["GEMINI_API_KEY"]
-                # ✅ document_processor.py에 정의된 함수 이름과 정확히 일치합니다.
-                final_result, debug_info = document_processor.run_extraction_pipeline(
+                # Pass the uploaded_file object to the pipeline
+                final_json_result = document_processor.run_final_pipeline(
                     document_text=document_text, 
                     api_key=api_key,
-                    status_container=status
+                    status_container=status,
+                    uploaded_file=uploaded_file 
                 )
-                st.session_state.analysis_result = {
-                    "final": final_result,
-                    "debug": debug_info,
+                st.session_state.final_result = {
+                    "data": final_json_result,
                     "file_name": uploaded_file.name
                 }
-                status.update(label="✅ 구조 추출 완료!", state="complete", expanded=False)
-                st.success("🎉 평탄화된 구조 추출이 성공적으로 완료되었습니다!")
+                status.update(label="✅ Analysis Complete!", state="complete", expanded=False)
+                st.success("🎉 All tasks completed successfully!")
+
             except Exception as e:
-                st.session_state.analysis_result = None
-                status.update(label="치명적 오류 발생", state="error", expanded=True)
-                st.error(f"처리 중 예상치 못한 오류가 발생했습니다: {e}")
+                st.session_state.final_result = None
+                status.update(label="A critical error occurred", state="error", expanded=True)
+                st.error(f"An unexpected error occurred during the process: {e}")
                 st.code(traceback.format_exc())
 
-if st.session_state.analysis_result:
-    result = st.session_state.analysis_result
-    final_result_data = result["final"]
-    debug_info = result["debug"]
-    file_name = result["file_name"]
+# Display results and download button if available in session state
+if st.session_state.final_result:
+    result = st.session_state.final_result["data"]
+    file_name = st.session_state.final_result["file_name"]
     
-    st.subheader("📋 결과 확인 및 다운로드")
-    
-    if "error" in final_result_data:
-        st.error(f"**분석 실패:** {final_result_data['error']}")
-    
-    with st.expander("추출된 구조 미리보기 (JSON)", expanded=False):
-        st.json(final_result_data)
-    
-    with st.expander("디버그 로그 미리보기 (JSON)", expanded=True):
-        st.json({"llm_responses": debug_info})
+    st.subheader("📊 Final Processed Result Preview")
+    st.json(result, expanded=False)
 
-    col1_dl, col2_dl = st.columns(2)
-    with col1_dl:
-        st.download_button(
-           label="✔️ 추출된 구조(JSON) 다운로드",
-           data=json.dumps(final_result_data, indent=2, ensure_ascii=False),
-           file_name=f"{file_name.split('.')[0]}_flat_structure.json",
-           mime="application/json",
-        )
-    with col2_dl:
-        st.download_button(
-           label="🐞 디버그 로그(JSON) 다운로드",
-           data=json.dumps(debug_info, indent=2, ensure_ascii=False),
-           file_name=f"{file_name.split('.')[0]}_debug.json",
-           mime="application/json",
-        )
+    st.download_button(
+       label="⬇️ Download Final JSON",
+       data=json.dumps(result, indent=2, ensure_ascii=False),
+       file_name=f"{file_name.split('.')[0]}_final_processed.json",
+       mime="application/json",
+    )
