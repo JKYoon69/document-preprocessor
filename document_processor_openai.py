@@ -10,7 +10,7 @@ import time
 # ==============================================================================
 # [ CONFIGURATION ] - OpenAI Version
 # ==============================================================================
-MODEL_NAME = "gpt-4.1-nano-2025-04-14"  # Use the desired OpenAI model
+MODEL_NAME = "gpt-4.1-mini-2025-04-14"  # Use the desired OpenAI model
 DETAIL_CHUNK_SIZE_THRESHOLD = 30000
 
 # Type mapping and Prompts can remain the same as they are model-agnostic.
