@@ -1,16 +1,20 @@
-# document_processor.py
-import google.generativeai as genai
+# document_processor_openai.py
+# This file contains the logic for processing documents using the OpenAI API.
+
+import os
+from openai import OpenAI, APIError
 import json
 import traceback
 import time
-from google.api_core.exceptions import InternalServerError
 
 # ==============================================================================
-# [ CONFIGURATION ]
+# [ CONFIGURATION ] - OpenAI Version
 # ==============================================================================
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gpt-4.1-nano-2025-04-14"  # Use the desired OpenAI model
 DETAIL_CHUNK_SIZE_THRESHOLD = 30000
 
+# Type mapping and Prompts can remain the same as they are model-agnostic.
+# You might need to tune them later if performance differs.
 TYPE_MAPPING = {
     "ภาค": "book", "ลักษณะ": "part", "หมวด": "chapter",
     "ส่วน": "section", "มาตรา": "article"
@@ -48,6 +52,8 @@ PROMPT_DETAILER = """You are a meticulous clerk for a Thai legal section. Your m
 # [ END OF CONFIGURATION ]
 # ==============================================================================
 
+# Helper functions (extract_json_from_response, chunk_text_semantic, postprocess_nodes)
+# are copied from the original file as they are model-agnostic.
 
 def extract_json_from_response(text):
     if not text:
@@ -84,8 +90,7 @@ def chunk_text_semantic(text, chunk_size_chars=30000, overlap_chars=3000):
     return chunks
 
 def postprocess_nodes(nodes, parent_text, global_offset=0):
-    if not nodes:
-        return []
+    if not nodes: return []
     parent_end = global_offset + len(parent_text)
     scoped_nodes = [node for node in nodes if 'global_start' in node and global_offset <= node['global_start'] < parent_end]
     unique_nodes = sorted(list({node['global_start']: node for node in scoped_nodes}.values()), key=lambda x: x['global_start'])
@@ -100,25 +105,39 @@ def postprocess_nodes(nodes, parent_text, global_offset=0):
         node['children'] = []
     return unique_nodes
 
-def _extract_structure(text_chunk, global_offset, model, safety_settings, prompt_template, debug_info, step_name):
+# CORE API CALL LOGIC (MODIFIED FOR OPENAI)
+def _extract_structure_openai(text_chunk, global_offset, client, prompt_template, debug_info, step_name):
     extracted_nodes = []
     retries = 3
     for attempt in range(retries):
         try:
             prompt = prompt_template.format(text_chunk=text_chunk)
             start_time = time.perf_counter()
-            response = model.generate_content(prompt, safety_settings=safety_settings)
+            
+            # OpenAI API Call
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"} # Use JSON mode
+            )
+            
             end_time = time.perf_counter()
             duration = end_time - start_time
             
-            response_text = ""
-            try:
-                response_text = response.text
-            except ValueError:
-                debug_info.append({f"{step_name}_generation_error": f"Response blocked or empty. Finish reason: {response.prompt_feedback}"})
-
+            response_text = response.choices[0].message.content
             debug_info.append({f"{step_name}_response": response_text, "llm_duration_seconds": duration})
+            
+            # The response from JSON mode should already be a JSON string
             nodes_in_chunk = extract_json_from_response(response_text)
+            
+            # OpenAI's JSON mode might return the list inside a root key, e.g. {"nodes": [...]}. 
+            # We need to handle this. Let's assume the LLM returns a list directly or inside one key.
+            if isinstance(nodes_in_chunk, dict):
+                # Look for a key that contains a list
+                for key, value in nodes_in_chunk.items():
+                    if isinstance(value, list):
+                        nodes_in_chunk = value
+                        break
 
             if isinstance(nodes_in_chunk, list):
                 for node in nodes_in_chunk:
@@ -127,12 +146,12 @@ def _extract_structure(text_chunk, global_offset, model, safety_settings, prompt
                         node['global_start'] = node['start_index'] + global_offset
                         extracted_nodes.append(node)
             else:
-                if response_text: # Only log parsing error if there was text to parse
+                if response_text:
                     debug_info.append({f"{step_name}_parsing_error": "Response was not a valid JSON list."})
             
             return extracted_nodes
-        
-        except InternalServerError as e:
+
+        except APIError as e: # Catch OpenAI specific errors
             debug_info.append({f"{step_name}_retryable_error": f"Attempt {attempt + 1} failed: {e}"})
             if attempt < retries - 1:
                 time.sleep(2)
@@ -143,20 +162,19 @@ def _extract_structure(text_chunk, global_offset, model, safety_settings, prompt
             return []
     return []
 
-def run_pipeline(document_text, api_key, status_container, 
-                 prompt_architect, prompt_surveyor, prompt_detailer,
-                 debug_info, intermediate_callback=None):
+# MAIN PIPELINE FUNCTION (MODIFIED FOR OPENAI)
+def run_openai_pipeline(document_text, api_key, status_container, 
+                        prompt_architect, prompt_surveyor, prompt_detailer,
+                        debug_info, intermediate_callback=None):
     
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(MODEL_NAME)
-    safety_settings = { "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE", "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-                      "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE", "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE" }
+    # Configure OpenAI client
+    client = OpenAI(api_key=api_key)
     
     timings = {}
 
-    status_container.write(f"1/3: **Architect** - Extracting top-level structure...")
+    status_container.write(f"1/3: **Architect (OpenAI)** - Extracting top-level structure...")
     step1_start = time.perf_counter()
-    top_level_nodes_raw = _extract_structure(document_text, 0, model, safety_settings, prompt_architect, debug_info, "step1_architect")
+    top_level_nodes_raw = _extract_structure_openai(document_text, 0, client, prompt_architect, debug_info, "step1_architect")
     
     if not top_level_nodes_raw or top_level_nodes_raw[0].get('global_start', 0) > 0:
         top_level_nodes_raw.insert(0, {'type': 'preamble', 'title': 'Preamble', 'global_start': 0})
@@ -171,16 +189,16 @@ def run_pipeline(document_text, api_key, status_container,
     if not final_tree:
         return {"error": "Step 1 failed: Could not find any top-level structure."}
 
-    status_container.write(f"2/3: **Surveyor** - Extracting mid-level structure (Sections)...")
+    status_container.write(f"2/3: **Surveyor (OpenAI)** - Extracting mid-level structure...")
     step2_start = time.perf_counter()
     for i, parent_node in enumerate(final_tree):
         if not parent_node.get('text', '').strip() or parent_node['type'] == 'preamble': continue
-        mid_level_nodes_raw = _extract_structure(parent_node['text'], parent_node['global_start'], model, safety_settings, prompt_surveyor, debug_info, f"step2_surveyor_parent_{i+1}")
+        mid_level_nodes_raw = _extract_structure_openai(parent_node['text'], parent_node['global_start'], client, prompt_surveyor, debug_info, f"step2_surveyor_parent_{i+1}")
         parent_node['children'] = postprocess_nodes(mid_level_nodes_raw, parent_node['text'], parent_node['global_start'])
     step2_end = time.perf_counter()
     timings["step2_surveyor_duration"] = step2_end - step2_start
 
-    status_container.write(f"3/3: **Detailer** - Extracting lowest-level structure (Articles)...")
+    status_container.write(f"3/3: **Detailer (OpenAI)** - Extracting lowest-level structure...")
     step3_start = time.perf_counter()
     
     def process_recursively(nodes):
@@ -196,8 +214,8 @@ def run_pipeline(document_text, api_key, status_container,
                 
                 for j, sub_chunk in enumerate(sub_chunks):
                     chunk_offset = node_offset + sub_chunk['start_char']
-                    articles_in_chunk = _extract_structure(
-                        sub_chunk['text'], chunk_offset, model, safety_settings, prompt_detailer, 
+                    articles_in_chunk = _extract_structure_openai(
+                        sub_chunk['text'], chunk_offset, client, prompt_detailer, 
                         debug_info, f"step3_detailer_parent_{i+1}_subchunk_{j+1}"
                     )
                     all_articles_raw.extend(articles_in_chunk)

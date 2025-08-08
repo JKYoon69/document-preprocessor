@@ -1,6 +1,7 @@
 # app.py
 import streamlit as st
-import document_processor as dp
+import document_processor as dp_gemini # Original Gemini processor
+import document_processor_openai as dp_openai # New OpenAI processor
 import json
 import traceback
 import pandas as pd
@@ -23,22 +24,49 @@ if 'debug_info' not in st.session_state:
     st.session_state.debug_info = []
 
 # --- UI Layout ---
-st.title("🏛️ Thai Legal Document Parser (v4.1)")
-st.markdown(f"**LLM Model:** `{dp.MODEL_NAME}` (Configurable in `document_processor.py`)")
-st.markdown("Analyzes the hierarchical structure of Thai legal documents using a 3-step pipeline with auto-retry and performance monitoring.")
+st.title("🏛️ Thai Legal Document Parser (v5.0 - Multi-Model)")
+st.markdown("Analyzes the hierarchical structure of Thai legal documents. Choose a model to run the analysis.")
 
-with st.expander("⚙️ Edit Prompts for Each Step"):
+# --- Model Selection UI ---
+st.sidebar.header("⚙️ Analysis Configuration")
+selected_model = st.sidebar.radio(
+    "Choose the LLM to use:",
+    ("Gemini (gemini-1.5-flash)", "OpenAI (gpt-4.1-nano)"),
+    key="model_selection"
+)
+
+# Display model-specific information
+if "Gemini" in selected_model:
+    model_name = dp_gemini.MODEL_NAME
+    st.sidebar.info("Uses Google's Gemini API. Optimized for speed and handling large contexts. Requires `GEMINI_API_KEY`.")
+else:
+    model_name = dp_openai.MODEL_NAME
+    st.sidebar.info("Uses OpenAI's API. Potentially better for complex JSON formatting. Requires `OPENAI_API_KEY`.")
+
+st.markdown(f"**Selected LLM:** `{model_name}`")
+
+
+# --- Prompt Editor ---
+# Prompts are mostly compatible, so we can use one set of editors
+with st.expander("📝 Edit Prompts for Each Step (Advanced)"):
+    # Initialize prompts in session state if they don't exist
+    if 'prompt1' not in st.session_state:
+        st.session_state.prompt1 = dp_gemini.PROMPT_ARCHITECT
+    if 'prompt2' not in st.session_state:
+        st.session_state.prompt2 = dp_gemini.PROMPT_SURVEYOR
+    if 'prompt3' not in st.session_state:
+        st.session_state.prompt3 = dp_gemini.PROMPT_DETAILER
+        
     tab1, tab2, tab3 = st.tabs(["Step 1: Architect", "Step 2: Surveyor", "Step 3: Detailer"])
     with tab1:
-        st.info("Defines the task to find top-level structures (Book, Part, Chapter) in the entire document.")
-        st.session_state.prompt1 = st.text_area("Architect Prompt", value=dp.PROMPT_ARCHITECT, height=250)
+        st.session_state.prompt1 = st.text_area("Architect Prompt", value=st.session_state.prompt1, height=250, key="p1")
     with tab2:
-        st.info("Defines the task to find mid-level structures (Section) within each Chapter.")
-        st.session_state.prompt2 = st.text_area("Surveyor Prompt", value=dp.PROMPT_SURVEYOR, height=250)
+        st.session_state.prompt2 = st.text_area("Surveyor Prompt", value=st.session_state.prompt2, height=250, key="p2")
     with tab3:
-        st.info("Defines the task to find the lowest-level structures (Article) within the smallest parent block.")
-        st.session_state.prompt3 = st.text_area("Detailer Prompt", value=dp.PROMPT_DETAILER, height=250)
+        st.session_state.prompt3 = st.text_area("Detailer Prompt", value=st.session_state.prompt3, height=250, key="p3")
 
+
+# --- File Uploader and Analysis Execution ---
 uploaded_file = st.file_uploader("Upload a Thai legal document (.txt)", type=['txt'])
 
 if uploaded_file is not None:
@@ -46,31 +74,40 @@ if uploaded_file is not None:
     char_count = len(document_text)
     st.info(f"📁 **{uploaded_file.name}** | Total characters: **{char_count:,}**")
 
-    if st.button("Run Hierarchical Analysis", type="primary"):
+    if st.button(f"Run Analysis with {model_name}", type="primary"):
         st.session_state.analysis_result = None
         st.session_state.debug_info.clear()
-
+        
+        # We need a placeholder for the intermediate callback to write to
+        intermediate_results_container = st.empty()
         def display_intermediate_result(result):
-            status_container = st.session_state.get('status_container')
-            if not status_container: return
-            
-            llm_duration = next((item.get('llm_duration_seconds', 0) for item in st.session_state.debug_info if "step1_architect_response" in item), 0)
-            status_container.write(f"✅ Step 1 Complete! (LLM call: {llm_duration:.2f}s)")
-            status_container.write("Found top-level structures:")
-            display_data = [{"type": n.get('type'), "title": n.get('title')} for n in result]
-            container = st.empty()
-            container.dataframe(display_data)
+            with intermediate_results_container.container():
+                st.write("---")
+                llm_duration = next((item.get('llm_duration_seconds', 0) for item in st.session_state.debug_info if "step1_architect_response" in item), 0)
+                st.write(f"✅ Step 1 Complete! (LLM call: {llm_duration:.2f}s)")
+                st.write("Found top-level structures:")
+                display_data = [{"type": n.get('type'), "title": n.get('title')} for n in result]
+                st.dataframe(display_data)
 
-        with st.status("Running 3-step analysis pipeline...", expanded=True) as status:
-            st.session_state['status_container'] = status
+        with st.status(f"Running 3-step analysis with {model_name}...", expanded=True) as status:
             try:
-                api_key = st.secrets["GEMINI_API_KEY"]
-                final_result = dp.run_pipeline(
-                    document_text=document_text, api_key=api_key, status_container=status,
-                    prompt_architect=st.session_state.prompt1, prompt_surveyor=st.session_state.prompt2,
-                    prompt_detailer=st.session_state.prompt3, debug_info=st.session_state.debug_info,
-                    intermediate_callback=display_intermediate_result
-                )
+                # --- CONDITIONAL PIPELINE EXECUTION ---
+                if "Gemini" in selected_model:
+                    api_key = st.secrets["GEMINI_API_KEY"]
+                    final_result = dp_gemini.run_pipeline(
+                        document_text=document_text, api_key=api_key, status_container=status,
+                        prompt_architect=st.session_state.prompt1, prompt_surveyor=st.session_state.prompt2,
+                        prompt_detailer=st.session_state.prompt3, debug_info=st.session_state.debug_info,
+                        intermediate_callback=display_intermediate_result
+                    )
+                else: # OpenAI
+                    api_key = st.secrets["OPENAI_API_KEY"]
+                    final_result = dp_openai.run_openai_pipeline(
+                        document_text=document_text, api_key=api_key, status_container=status,
+                        prompt_architect=st.session_state.prompt1, prompt_surveyor=st.session_state.prompt2,
+                        prompt_detailer=st.session_state.prompt3, debug_info=st.session_state.debug_info,
+                        intermediate_callback=display_intermediate_result
+                    )
                 
                 st.session_state.analysis_result = {
                     "final": final_result,
@@ -79,7 +116,7 @@ if uploaded_file is not None:
                 }
                 status.update(label="✅ Analysis complete!", state="complete", expanded=False)
                 st.success("🎉 Successfully generated the hierarchical structure!")
-                time.sleep(0.5)
+                time.sleep(1)
                 st.rerun()
 
             except Exception as e:
@@ -88,7 +125,9 @@ if uploaded_file is not None:
                 st.error(f"An unexpected error occurred during processing: {e}")
                 st.code(traceback.format_exc())
 
+# --- Display Results ---
 if st.session_state.analysis_result:
+    # This part of the code remains the same as it just displays the final result
     result = st.session_state.analysis_result
     final_result_data = result["final"]
     debug_info = result["debug"]
