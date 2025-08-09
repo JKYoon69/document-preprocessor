@@ -1,7 +1,7 @@
 # app.py
 import streamlit as st
-import document_processor as dp_gemini # Original Gemini processor
-import document_processor_openai as dp_openai # New OpenAI processor
+# [!!! MODIFIED !!!] - Gemini processor import removed
+import document_processor_openai as dp_openai 
 import json
 import traceback
 import pandas as pd
@@ -22,47 +22,29 @@ if 'analysis_result' not in st.session_state:
     st.session_state.analysis_result = None
 if 'debug_info' not in st.session_state:
     st.session_state.debug_info = []
-# [!!! NEW - Add session state for prompts !!!]
 if 'prompts' not in st.session_state:
     st.session_state.prompts = {}
 
 
 # --- UI Layout ---
-st.title("🏛️ Thai Legal Document Parser (v5.1 - Verified Pipeline)")
-st.markdown("Analyzes the hierarchical structure of Thai legal documents. Choose a model to run the analysis.")
+st.title("🏛️ Thai Legal Document Parser (OpenAI Verified Pipeline)")
+st.markdown("Analyzes the hierarchical structure of Thai legal documents using OpenAI.")
 
-
-# --- Model Selection UI ---
+# --- Model Configuration ---
 st.sidebar.header("⚙️ Analysis Configuration")
-selected_model = st.sidebar.radio(
-    "Choose the LLM to use:",
-    ("Gemini (gemini-1.5-flash)", "OpenAI (gpt-4.1-mini)"),
-    key="model_selection",
-    # [!!! NEW - on_change to clear prompts when model switches !!!]
-    on_change=lambda: st.session_state.prompts.clear()
-)
+# [!!! MODIFIED !!!] - Model selection removed, hardcoded to OpenAI
+model_name = dp_openai.MODEL_NAME
+st.sidebar.info(f"**Model:** `{model_name}`")
+st.sidebar.success("Uses OpenAI's API with a verification layer to ensure structural accuracy. Requires `OPENAI_API_KEY`.")
 
-# Display model-specific information and get correct model name and prompts
-if "Gemini" in selected_model:
-    model_name = dp_gemini.MODEL_NAME
-    prompt_module = dp_gemini
-    st.sidebar.info("Uses Google's Gemini API. Optimized for speed and handling large contexts. Requires `GEMINI_API_KEY`.")
-else:
-    model_name = dp_openai.MODEL_NAME
-    prompt_module = dp_openai
-    st.sidebar.info("Uses OpenAI's API with a verification layer. Better for complex JSON formatting. Requires `OPENAI_API_KEY`.")
-
-st.markdown(f"**Selected LLM:** `{model_name}`")
-
-
-# [!!! MODIFIED - Prompt Editor with dynamic loading !!!]
+# --- Prompt Editor ---
 with st.expander("📝 Edit Prompts for Each Step (Advanced)"):
-    # Initialize prompts from the correct module if they are not in session state for the current model
+    # [!!! MODIFIED !!!] - Simplified prompt loading for OpenAI only
     if not st.session_state.prompts:
         st.session_state.prompts = {
-            'prompt1': prompt_module.PROMPT_ARCHITECT,
-            'prompt2': prompt_module.PROMPT_SURVEYOR,
-            'prompt3': prompt_module.PROMPT_DETAILER
+            'prompt1': dp_openai.PROMPT_ARCHITECT,
+            'prompt2': dp_openai.PROMPT_SURVEYOR,
+            'prompt3': dp_openai.PROMPT_DETAILER
         }
         
     tab1, tab2, tab3 = st.tabs(["Step 1: Architect", "Step 2: Surveyor", "Step 3: Detailer"])
@@ -103,23 +85,14 @@ if uploaded_file is not None:
                 prompt2 = st.session_state.prompts['prompt2']
                 prompt3 = st.session_state.prompts['prompt3']
                 
-                # --- CONDITIONAL PIPELINE EXECUTION ---
-                if "Gemini" in selected_model:
-                    api_key = st.secrets["GEMINI_API_KEY"]
-                    final_result = dp_gemini.run_pipeline(
-                        document_text=document_text, api_key=api_key, status_container=status,
-                        prompt_architect=prompt1, prompt_surveyor=prompt2,
-                        prompt_detailer=prompt3, debug_info=st.session_state.debug_info,
-                        intermediate_callback=display_intermediate_result
-                    )
-                else: # OpenAI
-                    api_key = st.secrets["OPENAI_API_KEY"]
-                    final_result = dp_openai.run_openai_pipeline(
-                        document_text=document_text, api_key=api_key, status_container=status,
-                        prompt_architect=prompt1, prompt_surveyor=prompt2,
-                        prompt_detailer=prompt3, debug_info=st.session_state.debug_info,
-                        intermediate_callback=display_intermediate_result
-                    )
+                # [!!! MODIFIED !!!] - Pipeline execution now calls OpenAI function directly
+                api_key = st.secrets["OPENAI_API_KEY"]
+                final_result = dp_openai.run_openai_pipeline(
+                    document_text=document_text, api_key=api_key, status_container=status,
+                    prompt_architect=prompt1, prompt_surveyor=prompt2,
+                    prompt_detailer=prompt3, debug_info=st.session_state.debug_info,
+                    intermediate_callback=display_intermediate_result
+                )
                 
                 st.session_state.analysis_result = {
                     "final": final_result,
