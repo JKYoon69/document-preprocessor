@@ -24,30 +24,32 @@ if 'debug_info' not in st.session_state:
     st.session_state.debug_info = []
 
 # --- UI Layout ---
-st.title("🏛️ Thai Legal Document Parser (v5.0 - Multi-Model)")
-st.markdown("Analyzes the hierarchical structure of Thai legal documents. Choose a model to run the analysis.")
+st.title("🏛️ Thai Legal Document Parser (v5.1 - Verified Pipeline)")
+st.markdown("Analyzes the hierarchical structure of Thai legal documents. The processing pipeline includes an algorithmic verification step to prevent LLM hallucinations.")
 
 # --- Model Selection UI ---
 st.sidebar.header("⚙️ Analysis Configuration")
 selected_model = st.sidebar.radio(
     "Choose the LLM to use:",
-    ("Gemini (gemini-1.5-flash)", "OpenAI (gpt-4.1-nano)"),
+    ("Gemini (gemini-1.5-flash)", "OpenAI (gpt-4.1-mini)"), # Updated model name for clarity
     key="model_selection"
 )
 
 # Display model-specific information
 if "Gemini" in selected_model:
-    model_name = dp_gemini.MODEL_NAME
+    # This assumes the model name is defined in the processor file
+    model_name_display = "gemini-1.5-flash" 
     st.sidebar.info("Uses Google's Gemini API. Optimized for speed and handling large contexts. Requires `GEMINI_API_KEY`.")
 else:
-    model_name = dp_openai.MODEL_NAME
+    # This assumes the model name is defined in the processor file
+    model_name_display = "gpt-4.1-mini"
     st.sidebar.info("Uses OpenAI's API. Potentially better for complex JSON formatting. Requires `OPENAI_API_KEY`.")
 
-st.markdown(f"**Selected LLM:** `{model_name}`")
+st.markdown(f"**Selected LLM:** `{model_name_display}`")
 
 
 # --- Prompt Editor ---
-# Prompts are mostly compatible, so we can use one set of editors
+# Using Gemini's prompts as the base, as they are mostly compatible
 with st.expander("📝 Edit Prompts for Each Step (Advanced)"):
     # Initialize prompts in session state if they don't exist
     if 'prompt1' not in st.session_state:
@@ -74,27 +76,26 @@ if uploaded_file is not None:
     char_count = len(document_text)
     st.info(f"📁 **{uploaded_file.name}** | Total characters: **{char_count:,}**")
 
-    if st.button(f"Run Analysis with {model_name}", type="primary"):
+    if st.button(f"Run Analysis with {model_name_display}", type="primary"):
         st.session_state.analysis_result = None
         st.session_state.debug_info.clear()
         
-        # We need a placeholder for the intermediate callback to write to
         intermediate_results_container = st.empty()
         def display_intermediate_result(result):
             with intermediate_results_container.container():
                 st.write("---")
                 llm_duration = next((item.get('llm_duration_seconds', 0) for item in st.session_state.debug_info if "step1_architect_response" in item), 0)
-                st.write(f"✅ Step 1 Complete! (LLM call: {llm_duration:.2f}s)")
-                st.write("Found top-level structures:")
+                st.write(f"✅ Step 1 (Architect) Complete! Found top-level structures. (LLM call: {llm_duration:.2f}s)")
                 display_data = [{"type": n.get('type'), "title": n.get('title')} for n in result]
                 st.dataframe(display_data)
 
-        with st.status(f"Running 3-step analysis with {model_name}...", expanded=True) as status:
+        with st.status(f"Running 3-step analysis with {model_name_display}...", expanded=True) as status:
             try:
                 # --- CONDITIONAL PIPELINE EXECUTION ---
                 if "Gemini" in selected_model:
                     api_key = st.secrets["GEMINI_API_KEY"]
-                    final_result = dp_gemini.run_pipeline(
+                    # CORRECTED FUNCTION CALL
+                    final_result = dp_gemini.run_gemini_pipeline(
                         document_text=document_text, api_key=api_key, status_container=status,
                         prompt_architect=st.session_state.prompt1, prompt_surveyor=st.session_state.prompt2,
                         prompt_detailer=st.session_state.prompt3, debug_info=st.session_state.debug_info,
@@ -102,6 +103,7 @@ if uploaded_file is not None:
                     )
                 else: # OpenAI
                     api_key = st.secrets["OPENAI_API_KEY"]
+                    # This call was already correct
                     final_result = dp_openai.run_openai_pipeline(
                         document_text=document_text, api_key=api_key, status_container=status,
                         prompt_architect=st.session_state.prompt1, prompt_surveyor=st.session_state.prompt2,
@@ -127,7 +129,6 @@ if uploaded_file is not None:
 
 # --- Display Results ---
 if st.session_state.analysis_result:
-    # This part of the code remains the same as it just displays the final result
     result = st.session_state.analysis_result
     final_result_data = result["final"]
     debug_info = result["debug"]
