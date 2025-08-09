@@ -31,17 +31,15 @@ st.markdown("Analyzes the hierarchical structure of Thai legal documents. The pr
 st.sidebar.header("⚙️ Analysis Configuration")
 selected_model = st.sidebar.radio(
     "Choose the LLM to use:",
-    ("Gemini (gemini-1.5-flash)", "OpenAI (gpt-4.1-mini)"), # Updated model name for clarity
+    ("Gemini (gemini-1.5-flash)", "OpenAI (gpt-4.1-mini)"),
     key="model_selection"
 )
 
 # Display model-specific information
 if "Gemini" in selected_model:
-    # This assumes the model name is defined in the processor file
-    model_name_display = "gemini-1.5-flash" 
+    model_name_display = "gemini-1.5-flash"
     st.sidebar.info("Uses Google's Gemini API. Optimized for speed and handling large contexts. Requires `GEMINI_API_KEY`.")
 else:
-    # This assumes the model name is defined in the processor file
     model_name_display = "gpt-4.1-mini"
     st.sidebar.info("Uses OpenAI's API. Potentially better for complex JSON formatting. Requires `OPENAI_API_KEY`.")
 
@@ -49,16 +47,14 @@ st.markdown(f"**Selected LLM:** `{model_name_display}`")
 
 
 # --- Prompt Editor ---
-# Using Gemini's prompts as the base, as they are mostly compatible
 with st.expander("📝 Edit Prompts for Each Step (Advanced)"):
-    # Initialize prompts in session state if they don't exist
     if 'prompt1' not in st.session_state:
         st.session_state.prompt1 = dp_gemini.PROMPT_ARCHITECT
     if 'prompt2' not in st.session_state:
         st.session_state.prompt2 = dp_gemini.PROMPT_SURVEYOR
     if 'prompt3' not in st.session_state:
         st.session_state.prompt3 = dp_gemini.PROMPT_DETAILER
-        
+
     tab1, tab2, tab3 = st.tabs(["Step 1: Architect", "Step 2: Surveyor", "Step 3: Detailer"])
     with tab1:
         st.session_state.prompt1 = st.text_area("Architect Prompt", value=st.session_state.prompt1, height=250, key="p1")
@@ -79,7 +75,7 @@ if uploaded_file is not None:
     if st.button(f"Run Analysis with {model_name_display}", type="primary"):
         st.session_state.analysis_result = None
         st.session_state.debug_info.clear()
-        
+
         intermediate_results_container = st.empty()
         def display_intermediate_result(result):
             with intermediate_results_container.container():
@@ -94,23 +90,24 @@ if uploaded_file is not None:
                 # --- CONDITIONAL PIPELINE EXECUTION ---
                 if "Gemini" in selected_model:
                     api_key = st.secrets["GEMINI_API_KEY"]
-                    # CORRECTED FUNCTION CALL
+                    # ==========================================================
+                    # 여기가 수정된 부분입니다
                     final_result = dp_gemini.run_gemini_pipeline(
                         document_text=document_text, api_key=api_key, status_container=status,
                         prompt_architect=st.session_state.prompt1, prompt_surveyor=st.session_state.prompt2,
                         prompt_detailer=st.session_state.prompt3, debug_info=st.session_state.debug_info,
                         intermediate_callback=display_intermediate_result
                     )
+                    # ==========================================================
                 else: # OpenAI
                     api_key = st.secrets["OPENAI_API_KEY"]
-                    # This call was already correct
                     final_result = dp_openai.run_openai_pipeline(
                         document_text=document_text, api_key=api_key, status_container=status,
                         prompt_architect=st.session_state.prompt1, prompt_surveyor=st.session_state.prompt2,
                         prompt_detailer=st.session_state.prompt3, debug_info=st.session_state.debug_info,
                         intermediate_callback=display_intermediate_result
                     )
-                
+
                 st.session_state.analysis_result = {
                     "final": final_result,
                     "debug": st.session_state.debug_info,
@@ -141,7 +138,7 @@ if st.session_state.analysis_result:
     else:
         short_node_threshold = 15
         total_short_nodes = sum(count_short_nodes(node, short_node_threshold) for node in final_result_data.get('tree', []))
-        
+
         timings_list = [item for item in debug_info if "performance_timings" in item]
         if timings_list:
             timings = timings_list[0]['performance_timings']
