@@ -22,46 +22,56 @@ if 'analysis_result' not in st.session_state:
     st.session_state.analysis_result = None
 if 'debug_info' not in st.session_state:
     st.session_state.debug_info = []
+# [!!! NEW - Add session state for prompts !!!]
+if 'prompts' not in st.session_state:
+    st.session_state.prompts = {}
+
 
 # --- UI Layout ---
 st.title("🏛️ Thai Legal Document Parser (v5.1 - Verified Pipeline)")
-st.markdown("Analyzes the hierarchical structure of Thai legal documents. The processing pipeline includes an algorithmic verification step to prevent LLM hallucinations.")
+st.markdown("Analyzes the hierarchical structure of Thai legal documents. Choose a model to run the analysis.")
+
 
 # --- Model Selection UI ---
 st.sidebar.header("⚙️ Analysis Configuration")
 selected_model = st.sidebar.radio(
     "Choose the LLM to use:",
     ("Gemini (gemini-1.5-flash)", "OpenAI (gpt-4.1-mini)"),
-    key="model_selection"
+    key="model_selection",
+    # [!!! NEW - on_change to clear prompts when model switches !!!]
+    on_change=lambda: st.session_state.prompts.clear()
 )
 
-# Display model-specific information
+# Display model-specific information and get correct model name and prompts
 if "Gemini" in selected_model:
-    model_name_display = "gemini-1.5-flash"
+    model_name = dp_gemini.MODEL_NAME
+    prompt_module = dp_gemini
     st.sidebar.info("Uses Google's Gemini API. Optimized for speed and handling large contexts. Requires `GEMINI_API_KEY`.")
 else:
-    model_name_display = "gpt-4.1-mini"
-    st.sidebar.info("Uses OpenAI's API. Potentially better for complex JSON formatting. Requires `OPENAI_API_KEY`.")
+    model_name = dp_openai.MODEL_NAME
+    prompt_module = dp_openai
+    st.sidebar.info("Uses OpenAI's API with a verification layer. Better for complex JSON formatting. Requires `OPENAI_API_KEY`.")
 
-st.markdown(f"**Selected LLM:** `{model_name_display}`")
+st.markdown(f"**Selected LLM:** `{model_name}`")
 
 
-# --- Prompt Editor ---
+# [!!! MODIFIED - Prompt Editor with dynamic loading !!!]
 with st.expander("📝 Edit Prompts for Each Step (Advanced)"):
-    if 'prompt1' not in st.session_state:
-        st.session_state.prompt1 = dp_gemini.PROMPT_ARCHITECT
-    if 'prompt2' not in st.session_state:
-        st.session_state.prompt2 = dp_gemini.PROMPT_SURVEYOR
-    if 'prompt3' not in st.session_state:
-        st.session_state.prompt3 = dp_gemini.PROMPT_DETAILER
-
+    # Initialize prompts from the correct module if they are not in session state for the current model
+    if not st.session_state.prompts:
+        st.session_state.prompts = {
+            'prompt1': prompt_module.PROMPT_ARCHITECT,
+            'prompt2': prompt_module.PROMPT_SURVEYOR,
+            'prompt3': prompt_module.PROMPT_DETAILER
+        }
+        
     tab1, tab2, tab3 = st.tabs(["Step 1: Architect", "Step 2: Surveyor", "Step 3: Detailer"])
     with tab1:
-        st.session_state.prompt1 = st.text_area("Architect Prompt", value=st.session_state.prompt1, height=250, key="p1")
+        st.session_state.prompts['prompt1'] = st.text_area("Architect Prompt", value=st.session_state.prompts['prompt1'], height=300, key="p1")
     with tab2:
-        st.session_state.prompt2 = st.text_area("Surveyor Prompt", value=st.session_state.prompt2, height=250, key="p2")
+        st.session_state.prompts['prompt2'] = st.text_area("Surveyor Prompt", value=st.session_state.prompts['prompt2'], height=250, key="p2")
     with tab3:
-        st.session_state.prompt3 = st.text_area("Detailer Prompt", value=st.session_state.prompt3, height=250, key="p3")
+        st.session_state.prompts['prompt3'] = st.text_area("Detailer Prompt", value=st.session_state.prompts['prompt3'], height=250, key="p3")
 
 
 # --- File Uploader and Analysis Execution ---
@@ -72,42 +82,45 @@ if uploaded_file is not None:
     char_count = len(document_text)
     st.info(f"📁 **{uploaded_file.name}** | Total characters: **{char_count:,}**")
 
-    if st.button(f"Run Analysis with {model_name_display}", type="primary"):
+    if st.button(f"Run Analysis with {model_name}", type="primary"):
         st.session_state.analysis_result = None
         st.session_state.debug_info.clear()
-
+        
         intermediate_results_container = st.empty()
         def display_intermediate_result(result):
             with intermediate_results_container.container():
                 st.write("---")
                 llm_duration = next((item.get('llm_duration_seconds', 0) for item in st.session_state.debug_info if "step1_architect_response" in item), 0)
-                st.write(f"✅ Step 1 (Architect) Complete! Found top-level structures. (LLM call: {llm_duration:.2f}s)")
+                st.write(f"✅ Step 1 Complete! (LLM call: {llm_duration:.2f}s)")
+                st.write("Found top-level structures:")
                 display_data = [{"type": n.get('type'), "title": n.get('title')} for n in result]
                 st.dataframe(display_data)
 
-        with st.status(f"Running 3-step analysis with {model_name_display}...", expanded=True) as status:
+        with st.status(f"Running 3-step analysis with {model_name}...", expanded=True) as status:
             try:
+                # Use the prompts from session state
+                prompt1 = st.session_state.prompts['prompt1']
+                prompt2 = st.session_state.prompts['prompt2']
+                prompt3 = st.session_state.prompts['prompt3']
+                
                 # --- CONDITIONAL PIPELINE EXECUTION ---
                 if "Gemini" in selected_model:
                     api_key = st.secrets["GEMINI_API_KEY"]
-                    # ==========================================================
-                    # 여기가 수정된 부분입니다
-                    final_result = dp_gemini.run_gemini_pipeline(
+                    final_result = dp_gemini.run_pipeline(
                         document_text=document_text, api_key=api_key, status_container=status,
-                        prompt_architect=st.session_state.prompt1, prompt_surveyor=st.session_state.prompt2,
-                        prompt_detailer=st.session_state.prompt3, debug_info=st.session_state.debug_info,
+                        prompt_architect=prompt1, prompt_surveyor=prompt2,
+                        prompt_detailer=prompt3, debug_info=st.session_state.debug_info,
                         intermediate_callback=display_intermediate_result
                     )
-                    # ==========================================================
                 else: # OpenAI
                     api_key = st.secrets["OPENAI_API_KEY"]
                     final_result = dp_openai.run_openai_pipeline(
                         document_text=document_text, api_key=api_key, status_container=status,
-                        prompt_architect=st.session_state.prompt1, prompt_surveyor=st.session_state.prompt2,
-                        prompt_detailer=st.session_state.prompt3, debug_info=st.session_state.debug_info,
+                        prompt_architect=prompt1, prompt_surveyor=prompt2,
+                        prompt_detailer=prompt3, debug_info=st.session_state.debug_info,
                         intermediate_callback=display_intermediate_result
                     )
-
+                
                 st.session_state.analysis_result = {
                     "final": final_result,
                     "debug": st.session_state.debug_info,
@@ -138,7 +151,7 @@ if st.session_state.analysis_result:
     else:
         short_node_threshold = 15
         total_short_nodes = sum(count_short_nodes(node, short_node_threshold) for node in final_result_data.get('tree', []))
-
+        
         timings_list = [item for item in debug_info if "performance_timings" in item]
         if timings_list:
             timings = timings_list[0]['performance_timings']
@@ -165,7 +178,7 @@ if st.session_state.analysis_result:
         )
 
     with tab2:
-        st.info("This log contains raw LLM responses and performance data for each step.")
+        st.info("This log contains raw LLM responses, performance data, and verification failures for each step.")
         st.json({"pipeline_logs": debug_info}, expanded=False)
         st.download_button(
            label="Download Debug Log (JSON)",

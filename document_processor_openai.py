@@ -1,17 +1,16 @@
-# document_processor.py
-# This file contains the logic for processing documents using the Google Gemini API.
-# VERSION: "Trust but Verify" Algorithm Applied
+# document_processor_openai.py
+# This file contains the logic for processing documents using the OpenAI API.
 
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+import os
+from openai import OpenAI, APIError
 import json
 import traceback
 import time
 
 # ==============================================================================
-# [ CONFIGURATION ] - Gemini Version
+# [ CONFIGURATION ] - OpenAI Version
 # ==============================================================================
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gpt-4.1-mini-2025-04-14"
 DETAIL_CHUNK_SIZE_THRESHOLD = 30000
 
 TYPE_MAPPING = {
@@ -19,12 +18,16 @@ TYPE_MAPPING = {
     "ส่วน": "section", "มาตรา": "article"
 }
 
+# [!!! NEW - STRENGTHENED PROMPT !!!]
 PROMPT_ARCHITECT = """You are a top-level document architect for Thai legal codes. Your mission is to identify ONLY the highest-level structural blocks.
-1. Analyze the entire document text provided.
-2. Identify all headers for 'ภาค' (book), 'ลักษณะ' (part), and 'หมวด' (chapter).
-3. **STRICTLY IGNORE** all lower-level headers like 'ส่วน' (section) and 'มาตรา' (article).
-4. For each header found, create a JSON object with `type`, `title`, and its `start_index`.
-5. Return a single, flat JSON array of these objects. If no headers are found, return an empty array `[]`.
+1.  Analyze the entire document text provided.
+2.  Identify all headers for 'ภาค' (book), 'ลักษณะ' (part), and 'หมวด' (chapter).
+3.  **CRITICAL RULE**: A header is valid **ONLY IF** it appears on its own line. It MUST NOT be part of a sentence or a numbered list item.
+    -   **VALID Example**: The line is exactly "ภาค 1 บททั่วไป".
+    -   **INVALID Example**: The text is "ในภาค 1 นี้กล่าวถึง..." or "(๑) ศึกษาภาค 1".
+4.  **STRICTLY IGNORE** all lower-level headers like 'ส่วน' (section) and 'มาตรา' (article).
+5.  For each valid header found, create a JSON object with `type`, `title`, and its `start_index` within the provided text.
+6.  Return a single, flat JSON array of these objects. If no valid headers are found, return an empty array `[]`.
 
 [DOCUMENT TEXT]
 {text_chunk}"""
@@ -51,7 +54,6 @@ PROMPT_DETAILER = """You are a meticulous clerk for a Thai legal section. Your m
 # [ END OF CONFIGURATION ]
 # ==============================================================================
 
-# Helper functions (model-agnostic)
 def extract_json_from_response(text):
     if not text:
         return None
@@ -102,96 +104,92 @@ def postprocess_nodes(nodes, parent_text, global_offset=0):
         node['children'] = []
     return unique_nodes
 
-# CORE API CALL LOGIC (FOR GEMINI)
-def _extract_structure_gemini(text_chunk, global_offset, model, prompt_template, debug_info, step_name):
+# [!!! MODIFIED - CORE API CALL LOGIC WITH VERIFICATION !!!]
+def _extract_structure_openai(text_chunk, global_offset, client, prompt_template, debug_info, step_name):
+    final_nodes = []
     retries = 3
     for attempt in range(retries):
         try:
             prompt = prompt_template.format(text_chunk=text_chunk)
             start_time = time.perf_counter()
             
-            response = model.generate_content(prompt)
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
             
             end_time = time.perf_counter()
             duration = end_time - start_time
             
-            response_text = response.text
+            response_text = response.choices[0].message.content
             debug_info.append({f"{step_name}_response": response_text, "llm_duration_seconds": duration})
-
+            
             nodes_in_chunk = extract_json_from_response(response_text)
             
-            # ==================================================================
-            # [ START OF ALGORITHM HARDENING - "Trust but Verify" ]
-            # ==================================================================
-            validated_nodes = []
+            if isinstance(nodes_in_chunk, dict):
+                for key, value in nodes_in_chunk.items():
+                    if isinstance(value, list):
+                        nodes_in_chunk = value
+                        break
+
             if isinstance(nodes_in_chunk, list):
+                # [!!! NEW - VERIFICATION LOGIC !!!]
+                # Verify each node from the LLM before accepting it.
+                verified_nodes = []
                 for node in nodes_in_chunk:
                     if not (isinstance(node, dict) and all(k in node for k in ['type', 'title', 'start_index'])):
-                        debug_info.append({f"{step_name}_validation_skip": f"Skipping malformed node: {node}"})
-                        continue
-                    
-                    local_start_index = node['start_index']
-                    title_from_llm = node['title']
-
-                    if not (0 <= local_start_index < len(text_chunk)):
-                        debug_info.append({f"{step_name}_validation_fail_reason": "Index out of bounds", "failed_node": node})
                         continue
 
-                    is_at_line_start = (local_start_index == 0) or (text_chunk[local_start_index - 1] == '\n')
-                    if not is_at_line_start:
-                        debug_info.append({f"{step_name}_validation_fail_reason": "Node not at line start", "failed_node": node})
-                        continue
+                    index = node['start_index']
+                    title = node['title']
 
-                    actual_text_at_index = text_chunk[local_start_index : local_start_index + len(title_from_llm)]
-                    if not actual_text_at_index.strip() == title_from_llm.strip():
+                    # Verification 1: Must be at the start of a line.
+                    is_start_of_line = (index == 0) or (text_chunk[index-1] == '\n')
+                    # Verification 2: The title from the LLM must actually exist at that index in the source text.
+                    is_title_correct = text_chunk.startswith(title, index)
+
+                    if is_start_of_line and is_title_correct:
+                        # This node is valid.
+                        node['type'] = TYPE_MAPPING.get(node['type'], node['type'])
+                        node['global_start'] = node['start_index'] + global_offset
+                        verified_nodes.append(node)
+                    else:
+                        # This node is a hallucination. Log it and discard.
                         debug_info.append({
-                            f"{step_name}_validation_fail_reason": "Title mismatch with source text",
-                            "llm_title": title_from_llm, "actual_text": actual_text_at_index, "failed_node": node
+                            f"{step_name}_verification_failed": "Filtered out a hallucinated node.",
+                            "node_details": node,
+                            "reason": f"Start of line: {is_start_of_line}, Title correct: {is_title_correct}"
                         })
-                        continue
-                    
-                    node['type'] = TYPE_MAPPING.get(node['type'], node['type'])
-                    node['global_start'] = node['start_index'] + global_offset
-                    validated_nodes.append(node)
+                final_nodes = verified_nodes
             else:
-                 if response_text:
+                if response_text:
                     debug_info.append({f"{step_name}_parsing_error": "Response was not a valid JSON list."})
             
-            return validated_nodes
-            # ==================================================================
-            # [ END OF ALGORITHM HARDENING ]
-            # ==================================================================
+            return final_nodes
 
-        except Exception as e:
-            debug_info.append({f"{step_name}_error": f"Attempt {attempt + 1} failed: {e}", "trace": traceback.format_exc()})
+        except APIError as e:
+            debug_info.append({f"{step_name}_retryable_error": f"Attempt {attempt + 1} failed: {e}"})
             if attempt < retries - 1:
                 time.sleep(2)
             else:
                 raise e
+        except Exception as e:
+            debug_info.append({f"{step_name}_critical_error": traceback.format_exc()})
+            return []
     return []
 
-# MAIN PIPELINE FUNCTION (FOR GEMINI)
-def run_gemini_pipeline(document_text, api_key, status_container, 
+# MAIN PIPELINE FUNCTION (MODIFIED FOR OPENAI)
+def run_openai_pipeline(document_text, api_key, status_container, 
                         prompt_architect, prompt_surveyor, prompt_detailer,
                         debug_info, intermediate_callback=None):
     
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        MODEL_NAME,
-        safety_settings={
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-        },
-        generation_config=genai.GenerationConfig(response_mime_type="application/json")
-    )
-
+    client = OpenAI(api_key=api_key)
     timings = {}
 
-    status_container.write(f"1/3: **Architect (Gemini)** - Extracting top-level structure...")
+    status_container.write(f"1/3: **Architect (OpenAI)** - Extracting top-level structure...")
     step1_start = time.perf_counter()
-    top_level_nodes_raw = _extract_structure_gemini(document_text, 0, model, prompt_architect, debug_info, "step1_architect")
+    top_level_nodes_raw = _extract_structure_openai(document_text, 0, client, prompt_architect, debug_info, "step1_architect")
     
     if not top_level_nodes_raw or top_level_nodes_raw[0].get('global_start', 0) > 0:
         top_level_nodes_raw.insert(0, {'type': 'preamble', 'title': 'Preamble', 'global_start': 0})
@@ -206,16 +204,16 @@ def run_gemini_pipeline(document_text, api_key, status_container,
     if not final_tree:
         return {"error": "Step 1 failed: Could not find any top-level structure."}
 
-    status_container.write(f"2/3: **Surveyor (Gemini)** - Extracting mid-level structure...")
+    status_container.write(f"2/3: **Surveyor (OpenAI)** - Extracting mid-level structure...")
     step2_start = time.perf_counter()
     for i, parent_node in enumerate(final_tree):
         if not parent_node.get('text', '').strip() or parent_node['type'] == 'preamble': continue
-        mid_level_nodes_raw = _extract_structure_gemini(parent_node['text'], parent_node['global_start'], model, prompt_surveyor, debug_info, f"step2_surveyor_parent_{i+1}")
+        mid_level_nodes_raw = _extract_structure_openai(parent_node['text'], parent_node['global_start'], client, prompt_surveyor, debug_info, f"step2_surveyor_parent_{i+1}")
         parent_node['children'] = postprocess_nodes(mid_level_nodes_raw, parent_node['text'], parent_node['global_start'])
     step2_end = time.perf_counter()
     timings["step2_surveyor_duration"] = step2_end - step2_start
 
-    status_container.write(f"3/3: **Detailer (Gemini)** - Extracting lowest-level structure...")
+    status_container.write(f"3/3: **Detailer (OpenAI)** - Extracting lowest-level structure...")
     step3_start = time.perf_counter()
     
     def process_recursively(nodes):
@@ -231,8 +229,8 @@ def run_gemini_pipeline(document_text, api_key, status_container,
                 
                 for j, sub_chunk in enumerate(sub_chunks):
                     chunk_offset = node_offset + sub_chunk['start_char']
-                    articles_in_chunk = _extract_structure_gemini(
-                        sub_chunk['text'], chunk_offset, model, prompt_detailer, 
+                    articles_in_chunk = _extract_structure_openai(
+                        sub_chunk['text'], chunk_offset, client, prompt_detailer, 
                         debug_info, f"step3_detailer_parent_{i+1}_subchunk_{j+1}"
                     )
                     all_articles_raw.extend(articles_in_chunk)
