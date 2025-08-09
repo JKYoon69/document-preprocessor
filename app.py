@@ -1,6 +1,5 @@
 # app.py
 import streamlit as st
-# [!!! MODIFIED !!!] - Gemini processor import removed
 import document_processor_openai as dp_openai 
 import json
 import traceback
@@ -22,39 +21,21 @@ if 'analysis_result' not in st.session_state:
     st.session_state.analysis_result = None
 if 'debug_info' not in st.session_state:
     st.session_state.debug_info = []
-if 'prompts' not in st.session_state:
-    st.session_state.prompts = {}
-
 
 # --- UI Layout ---
-st.title("🏛️ Thai Legal Document Parser (OpenAI Verified Pipeline)")
-st.markdown("Analyzes the hierarchical structure of Thai legal documents using OpenAI.")
+st.title("🏛️ Thai Legal Document Parser (v6.0 - Parser-First)")
+st.markdown("Analyzes the hierarchical structure of Thai legal documents using a robust **Parser-First** approach.")
 
 # --- Model Configuration ---
 st.sidebar.header("⚙️ Analysis Configuration")
-# [!!! MODIFIED !!!] - Model selection removed, hardcoded to OpenAI
 model_name = dp_openai.MODEL_NAME
-st.sidebar.info(f"**Model:** `{model_name}`")
-st.sidebar.success("Uses OpenAI's API with a verification layer to ensure structural accuracy. Requires `OPENAI_API_KEY`.")
-
-# --- Prompt Editor ---
-with st.expander("📝 Edit Prompts for Each Step (Advanced)"):
-    # [!!! MODIFIED !!!] - Simplified prompt loading for OpenAI only
-    if not st.session_state.prompts:
-        st.session_state.prompts = {
-            'prompt1': dp_openai.PROMPT_ARCHITECT,
-            'prompt2': dp_openai.PROMPT_SURVEYOR,
-            'prompt3': dp_openai.PROMPT_DETAILER
-        }
-        
-    tab1, tab2, tab3 = st.tabs(["Step 1: Architect", "Step 2: Surveyor", "Step 3: Detailer"])
-    with tab1:
-        st.session_state.prompts['prompt1'] = st.text_area("Architect Prompt", value=st.session_state.prompts['prompt1'], height=300, key="p1")
-    with tab2:
-        st.session_state.prompts['prompt2'] = st.text_area("Surveyor Prompt", value=st.session_state.prompts['prompt2'], height=250, key="p2")
-    with tab3:
-        st.session_state.prompts['prompt3'] = st.text_area("Detailer Prompt", value=st.session_state.prompts['prompt3'], height=250, key="p3")
-
+st.sidebar.info(f"**LLM:** `{model_name}`")
+st.sidebar.success("""
+**New Architecture:**
+1.  **Parser:** Python code first finds all potential headers with 100% accurate locations.
+2.  **LLM:** OpenAI then organizes this clean list into a hierarchical tree.
+""")
+# [!!! REMOVED !!!] - Prompt editor is no longer needed.
 
 # --- File Uploader and Analysis Execution ---
 uploaded_file = st.file_uploader("Upload a Thai legal document (.txt)", type=['txt'])
@@ -64,34 +45,20 @@ if uploaded_file is not None:
     char_count = len(document_text)
     st.info(f"📁 **{uploaded_file.name}** | Total characters: **{char_count:,}**")
 
-    if st.button(f"Run Analysis with {model_name}", type="primary"):
+    if st.button(f"Run Analysis", type="primary"):
         st.session_state.analysis_result = None
         st.session_state.debug_info.clear()
         
-        intermediate_results_container = st.empty()
-        def display_intermediate_result(result):
-            with intermediate_results_container.container():
-                st.write("---")
-                llm_duration = next((item.get('llm_duration_seconds', 0) for item in st.session_state.debug_info if "step1_architect_response" in item), 0)
-                st.write(f"✅ Step 1 Complete! (LLM call: {llm_duration:.2f}s)")
-                st.write("Found top-level structures:")
-                display_data = [{"type": n.get('type'), "title": n.get('title')} for n in result]
-                st.dataframe(display_data)
+        intermediate_results_container = st.empty() # Placeholder for potential future use
 
-        with st.status(f"Running 3-step analysis with {model_name}...", expanded=True) as status:
+        with st.status(f"Running Parser-First analysis with {model_name}...", expanded=True) as status:
             try:
-                # Use the prompts from session state
-                prompt1 = st.session_state.prompts['prompt1']
-                prompt2 = st.session_state.prompts['prompt2']
-                prompt3 = st.session_state.prompts['prompt3']
-                
-                # [!!! MODIFIED !!!] - Pipeline execution now calls OpenAI function directly
                 api_key = st.secrets["OPENAI_API_KEY"]
                 final_result = dp_openai.run_openai_pipeline(
-                    document_text=document_text, api_key=api_key, status_container=status,
-                    prompt_architect=prompt1, prompt_surveyor=prompt2,
-                    prompt_detailer=prompt3, debug_info=st.session_state.debug_info,
-                    intermediate_callback=display_intermediate_result
+                    document_text=document_text, 
+                    api_key=api_key, 
+                    status_container=status,
+                    debug_info=st.session_state.debug_info
                 )
                 
                 st.session_state.analysis_result = {
@@ -120,7 +87,7 @@ if st.session_state.analysis_result:
     st.header("📄 Analysis Results")
 
     if "error" in final_result_data or not final_result_data.get("tree"):
-        st.error("Analysis failed. Please check the debug log for more details.")
+        st.error(f"Analysis failed: {final_result_data.get('error', 'Unknown error')}. Please check the debug log for more details.")
     else:
         short_node_threshold = 15
         total_short_nodes = sum(count_short_nodes(node, short_node_threshold) for node in final_result_data.get('tree', []))
@@ -130,9 +97,9 @@ if st.session_state.analysis_result:
             timings = timings_list[0]['performance_timings']
             st.subheader("📊 Performance Summary")
             col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Step 1 (Architect)", f"{timings.get('step1_architect_duration', 0):.2f} s")
-            col2.metric("Step 2 (Surveyor)", f"{timings.get('step2_surveyor_duration', 0):.2f} s")
-            col3.metric("Step 3 (Detailer)", f"{timings.get('step3_detailer_duration', 0):.2f} s")
+            col1.metric("Step 1 (Parser)", f"{timings.get('step1_parser_duration', 0):.2f} s")
+            col2.metric("Step 2 (LLM)", f"{timings.get('step2_llm_duration', 0):.2f} s")
+            col3.metric("Step 3 (Post-proc)", f"{timings.get('step3_postprocess_duration', 0):.2f} s")
             col4.metric(f"Short Nodes (<{short_node_threshold} chars)", f"{total_short_nodes}",
                         help=f"Number of nodes with less than {short_node_threshold} characters of text.",
                         delta=f"-{total_short_nodes}" if total_short_nodes > 0 else None,
@@ -151,7 +118,7 @@ if st.session_state.analysis_result:
         )
 
     with tab2:
-        st.info("This log contains raw LLM responses, performance data, and verification failures for each step.")
+        st.info("This log contains Regex parser results and the raw LLM response.")
         st.json({"pipeline_logs": debug_info}, expanded=False)
         st.download_button(
            label="Download Debug Log (JSON)",
