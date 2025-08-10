@@ -10,9 +10,10 @@ import time
 import re
 
 # ==============================================================================
-# [ CONFIGURATION ] - v10.1 Final Corrected Version
+# [ CONFIGURATION ] - v12.0 Model Changed to GPT-4.1-Mini
 # ==============================================================================
-MODEL_NAME = "gpt-4.1-2025-04-14"
+MODEL_NAME = "gpt-4.1-mini-2025-04-14" # [!!! CHANGED !!!] - Cost-effective model for summarization
+MAX_CHARS_FOR_SUMMARY = 64000 
 
 HIERARCHY_LEVELS = {
     "book": 1,      # ภาค
@@ -28,25 +29,29 @@ TYPE_MAPPING = {
     "ส่วน": "section", "มาตรา": "article"
 }
 
-PROMPT_HIERARCHICAL_SUMMARIZER = """You are a Thai legal assistant. Your task is to create a concise, one-sentence summary for a specific section of a legal document.
+PROMPT_HIERARCHICAL_SUMMARIZER = """You are a Thai legal assistant. Your task is to create a concise, one-sentence summary for a specific section of a legal document based on its structure.
 
-You will be given the parent section's summary for context, and the full text of the current section.
+You will be given the parent section's summary for context, the title of the current section, and a list of its direct sub-section titles.
 
--   **Parent Context**: This provides the broader legal context.
--   **Current Section Text**: This is the text you need to summarize.
+-   **Parent Context**: Provides the broader legal context.
+-   **Current Section Title**: The title of the section you need to summarize (e.g., "ภาค 1 บททั่วไป").
+-   **Sub-section Titles**: A list of titles under the current section (e.g., ["ลักษณะ 1 การจดทะเบียน", "ลักษณะ 2 บทกำหนดโทษ"]).
 
-Based on BOTH pieces of information, create a summary that explains the main purpose of the **Current Section Text** within the **Parent Context**.
+Based on the title of the current section AND the titles of its sub-sections, infer the main purpose of the current section and create a single-sentence summary.
 
 [Parent Context Summary]
 {parent_summary}
 
-[Current Section Text to Summarize]
-{text_chunk}
+[Current Section Title]
+{current_node_title}
 
-Return ONLY the one-sentence summary of the Current Section Text.
+[Sub-section Titles]
+{child_titles}
+
+Return ONLY the one-sentence summary of the Current Section.
 """
 
-PROMPT_SUMMARIZER = """You are a legal assistant. Read the entire provided Thai legal document and generate a concise, one-paragraph summary. The summary should explain the main purpose and key subjects of the law or decree. Start the summary with "This document is about...".
+PROMPT_SUMMARIZER = """You are a legal assistant. Read the provided beginning of a Thai legal document and generate a concise, one-paragraph summary. The summary should explain the main purpose and key subjects of the law or decree. Start the summary with "This document is about...".
 
 [DOCUMENT TEXT]
 {text_chunk}
@@ -60,7 +65,6 @@ Return ONLY the summary text.
 
 def _parse_candidate_nodes(text_chunk):
     candidate_nodes = []
-    # [!!! ENHANCED REGEX !!!] - Now captures 'หมายเหตุ' (Notes) at the end.
     pattern = re.compile(
         r"^(ภาค|ลักษณะ|หมวด|ส่วน|มาตรา|บทเฉพาะกาล|บทกำหนดโทษ|อัตราค่าธรรมเนียม|หมายเหตุ)\s*.*$", 
         re.MULTILINE
@@ -91,7 +95,6 @@ def _build_tree_from_flat_list(nodes):
     for node in nodes:
         node['children'] = []
         node_level = HIERARCHY_LEVELS.get(node['type'], 99)
-        # FIX: Changed from '>=' to '>' to correctly handle sibling nodes.
         while stack and HIERARCHY_LEVELS.get(stack[-1]['type'], 99) >= node_level:
             stack.pop()
         
@@ -114,19 +117,38 @@ def _recursive_postprocess(nodes, full_document_text, parent_global_end):
 def _generate_hierarchical_summaries(nodes, client, llm_log, parent_summary="This document is a Thai legal code."):
     for node in nodes:
         if node.get('children'):
-            prompt = PROMPT_HIERARCHICAL_SUMMARIZER.format(parent_summary=parent_summary, text_chunk=node['text'])
+            child_titles = [child.get('title', '') for child in node.get('children', [])]
+            child_titles_str = "\n".join(f"- {title}" for title in child_titles)
+
+            prompt = PROMPT_HIERARCHICAL_SUMMARIZER.format(
+                parent_summary=parent_summary,
+                current_node_title=node['title'],
+                child_titles=child_titles_str
+            )
+            
+            summary = "Summary generation failed."
             try:
-                response = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}])
+                response = client.chat.completions.create(
+                    model=MODEL_NAME, 
+                    messages=[{"role": "user", "content": prompt}]
+                )
                 summary = response.choices[0].message.content
-                node['summary'] = summary
                 usage = response.usage
                 llm_log["count"] += 1
-                call_log = {"call_number": llm_log["count"], "purpose": f"Summarize Node: {node['title'][:50]}...", "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens, "total_tokens": usage.total_tokens}
+                call_log = {
+                    "call_number": llm_log["count"], 
+                    "purpose": f"Summarize Node by Structure: {node['title'][:50]}...", 
+                    "prompt_tokens": usage.prompt_tokens, 
+                    "completion_tokens": usage.completion_tokens, 
+                    "total_tokens": usage.total_tokens
+                }
                 llm_log["details"].append(call_log)
-                _generate_hierarchical_summaries(node['children'], client, llm_log, parent_summary=summary)
             except Exception as e:
-                node['summary'] = "Summary generation failed."
-                llm_log["details"].append({"error": f"Failed to summarize {node['title']}: {e}"})
+                summary = f"Summary generation failed for node '{node['title']}': {e}"
+                llm_log["details"].append({"error": summary, "node_title": node.get('title')})
+
+            node['summary'] = summary
+            _generate_hierarchical_summaries(node['children'], client, llm_log, parent_summary=summary)
 
 def _flatten_tree_to_chunks(nodes, parent_breadcrumbs=None, parent_summaries=None):
     if parent_breadcrumbs is None: parent_breadcrumbs = []
@@ -139,7 +161,7 @@ def _flatten_tree_to_chunks(nodes, parent_breadcrumbs=None, parent_summaries=Non
             node['context_path'] = " > ".join(filter(None, parent_breadcrumbs))
             node['context_summary'] = " ".join(filter(None, current_summaries))
             node.pop('children', None)
-            node.pop('summary', None) # Clean up summary from leaf node
+            node.pop('summary', None)
             final_chunks.append(node)
         else:
             final_chunks.extend(_flatten_tree_to_chunks(node['children'], current_breadcrumbs, current_summaries))
@@ -165,10 +187,7 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
     final_tree.extend(structured_main_tree)
     
     _recursive_postprocess(final_tree, document_text, len(document_text))
-    
-    # [!!! RE-ADDED THE MISSING LLM CALL !!!]
     _generate_hierarchical_summaries(final_tree, client, llm_log)
-    
     debug_info.append({"pipeline_a_full_hierarchical_tree_with_summaries": final_tree})
 
     rag_chunks = _flatten_tree_to_chunks(final_tree)
@@ -177,7 +196,15 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
 def _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log):
     summary = "Summary generation failed."
     try:
-        summary_prompt = PROMPT_SUMMARIZER.format(text_chunk=document_text)
+        if len(document_text) > MAX_CHARS_FOR_SUMMARY:
+            truncated_text = document_text[:MAX_CHARS_FOR_SUMMARY]
+            debug_info.append({
+                "warning": f"Document text was truncated to {MAX_CHARS_FOR_SUMMARY} chars for the main summary to prevent context overflow."
+            })
+        else:
+            truncated_text = document_text
+
+        summary_prompt = PROMPT_SUMMARIZER.format(text_chunk=truncated_text)
         response = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": summary_prompt}])
         summary = response.choices[0].message.content
         usage = response.usage
@@ -217,7 +244,6 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     client = OpenAI(api_key=api_key)
     timings = {}
     
-    # Correctly initialize and manage the debug logging
     llm_log_container = {"llm_calls": {"count": 0, "details": []}}
     debug_info.append(llm_log_container)
 
@@ -228,9 +254,7 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     debug_info.append({"profiling_result": {"has_complex_structure": has_complex_structure}})
     
     final_result = {}
-    # [!!! FIX !!!] - Pass the correct logging objects to the sub-pipelines.
-    # `debug_info` is the main list for general logs.
-    # `llm_log_container["llm_calls"]` is the specific dict for LLM call details.
+    
     if has_complex_structure:
         status_container.write("-> Complex document. Running Hierarchical Summarization Pipeline.")
         debug_info.append({"selected_pipeline": "A: Deep Hierarchical"})
