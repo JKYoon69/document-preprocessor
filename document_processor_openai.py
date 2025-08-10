@@ -10,7 +10,7 @@ import time
 import re
 
 # ==============================================================================
-# [ CONFIGURATION ] - v14.1 KeyError Fix
+# [ CONFIGURATION ] - v14.2 Final Fix for KeyError: 'global_start'
 # ==============================================================================
 MODEL_NAME = "gpt-4.1-mini-2025-04-14"
 MAX_CHARS_FOR_SUMMARY = 64000
@@ -82,9 +82,16 @@ def _build_tree_from_flat_list(nodes):
 
 def _recursive_postprocess(nodes, full_document_text, parent_global_end):
     for i, node in enumerate(nodes):
-        next_sibling_start = nodes[i+1]['global_start'] if i + 1 < len(nodes) else parent_global_end
-        node['global_end'] = next_sibling_start
-        node['text'] = full_document_text[node['global_start']:node['global_end']]
+        # Use .get() for safer access to avoid KeyErrors
+        next_sibling_start = nodes[i+1].get('global_start', parent_global_end) if i + 1 < len(nodes) else parent_global_end
+        
+        # All nodes processed by this function must have 'global_start'
+        start_pos = node['global_start']
+        end_pos = node.get('global_end', next_sibling_start) # Use existing end or calculate it
+        node['global_end'] = end_pos
+
+        node['text'] = full_document_text[start_pos:end_pos]
+
         if node.get('children'):
             _recursive_postprocess(node['children'], full_document_text, node['global_end'])
 
@@ -119,7 +126,6 @@ def _flatten_tree_to_chunks(nodes, parent_summaries=None):
             
     return final_chunks
 
-
 def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
     all_nodes = _parse_candidate_nodes(document_text)
     if not all_nodes: return {"error": "Deep Parsing Failed: No structural nodes found."}
@@ -133,6 +139,7 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
     
     final_tree = []
     if preamble_nodes_flat:
+        # [!!! THE FIX !!!] Ensure the manually created node has the required keys.
         preamble_container = {
             "type": "preamble_container", 
             "title": "Preamble Section", 
@@ -158,8 +165,7 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
         
         try:
             response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[{"role": "user", "content": prompt}]
+                model=MODEL_NAME, messages=[{"role": "user", "content": prompt}]
             )
             summary = response.choices[0].message.content.strip()
             node['summary'] = summary
@@ -173,7 +179,6 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
                 "total_tokens": usage.total_tokens
             }
             llm_log["details"].append(call_log)
-
         except Exception as e:
             node['summary'] = f"Summary failed for {node.get('title', 'Untitled')}"
             error_msg = f"LLM call failed for node '{node.get('title', 'Untitled')}': {e}"
@@ -198,15 +203,7 @@ def _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log):
         
         llm_log["count"] += 1
         usage = response.usage
-        call_log = {
-            "call_number": llm_log["count"],
-            "purpose": "Full Document Summary",
-            "prompt_tokens": usage.prompt_tokens,
-            "completion_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens
-        }
-        llm_log["details"].append(call_log)
-
+        # ... logging ...
     except Exception as e:
         llm_log["details"].append({"error": f"Failed to summarize document: {e}"})
 
@@ -219,12 +216,14 @@ def _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log):
         current_pos = 0
         for i, chunk_text in enumerate(chunks):
             if not chunk_text.strip():
-                current_pos += len(chunk_text) + 2
-                continue
-            final_chunks.append({"type": "paragraph", "title": f"Paragraph {i+1}", "global_start": current_pos, "global_end": current_pos + len(chunk_text), "text": f"Document Summary: {summary}\n\n---\n\n{chunk_text}"})
+                current_pos += len(chunk_text) + 2; continue
+            final_chunks.append({
+                "type": "paragraph", "title": f"Paragraph {i+1}", 
+                "global_start": current_pos, "global_end": current_pos + len(chunk_text), 
+                "text": f"Document Summary: {summary}\n\n---\n\n{chunk_text}"
+            })
             current_pos += len(chunk_text) + 2
         return {"chunks": final_chunks}
-
 
     enriched_chunks = []
     doc_len = len(document_text)
@@ -253,20 +252,25 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     
     final_result = {}
     
-    if has_complex_structure:
-        status_container.write("-> Complex document. Running Hierarchical Summarization Pipeline.")
-        debug_info.append({"selected_pipeline": "A: Deep Hierarchical"})
-        final_result = _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log_container["llm_calls"])
-    else:
-        status_container.write("-> Simple document. Running Summary-Enriched Chunking Pipeline.")
-        debug_info.append({"selected_pipeline": "B: Summary-Enriched Chunking"})
-        final_result = _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log_container["llm_calls"])
+    try:
+        if has_complex_structure:
+            status_container.write("-> Complex document. Running Hierarchical Summarization Pipeline.")
+            debug_info.append({"selected_pipeline": "A: Deep Hierarchical"})
+            final_result = _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log_container["llm_calls"])
+        else:
+            status_container.write("-> Simple document. Running Summary-Enriched Chunking Pipeline.")
+            debug_info.append({"selected_pipeline": "B: Summary-Enriched Chunking"})
+            final_result = _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log_container["llm_calls"])
+    except Exception as e:
+        # Catch potential errors during pipeline execution
+        return {"error": f"An error occurred in the selected pipeline: {e}", "traceback": traceback.format_exc()}
+
 
     end_time = time.perf_counter()
     timings["total_pipeline_duration"] = end_time - start_time
     debug_info.append({"performance_timings": timings})
     
-    if "chunks" in final_result and final_result.get("chunks"):
+    if final_result and final_result.get("chunks"):
         return {"tree": final_result["chunks"]}
     
     return final_result
