@@ -10,7 +10,7 @@ import time
 import re
 
 # ==============================================================================
-# [ CONFIGURATION ] - v14.2 Final Fix for KeyError: 'global_start'
+# [ CONFIGURATION ] - v15.0 Fix for Missing Preamble
 # ==============================================================================
 MODEL_NAME = "gpt-4.1-mini-2025-04-14"
 MAX_CHARS_FOR_SUMMARY = 64000
@@ -82,40 +82,31 @@ def _build_tree_from_flat_list(nodes):
 
 def _recursive_postprocess(nodes, full_document_text, parent_global_end):
     for i, node in enumerate(nodes):
-        # Use .get() for safer access to avoid KeyErrors
         next_sibling_start = nodes[i+1].get('global_start', parent_global_end) if i + 1 < len(nodes) else parent_global_end
-        
-        # All nodes processed by this function must have 'global_start'
         start_pos = node['global_start']
-        end_pos = node.get('global_end', next_sibling_start) # Use existing end or calculate it
+        end_pos = node.get('global_end', next_sibling_start)
         node['global_end'] = end_pos
-
         node['text'] = full_document_text[start_pos:end_pos]
-
         if node.get('children'):
             _recursive_postprocess(node['children'], full_document_text, node['global_end'])
 
 def _get_all_parent_nodes(nodes):
     parent_nodes = []
-    
     def traverse(sub_nodes):
         for node in sub_nodes:
             if node.get('children'):
                 parent_nodes.append(node)
                 traverse(node['children'])
-                
     traverse(nodes)
     return parent_nodes
 
 def _flatten_tree_to_chunks(nodes, parent_summaries=None):
     if parent_summaries is None: parent_summaries = []
-    
     final_chunks = []
     for node in nodes:
         current_summaries = parent_summaries
         if node.get('summary'):
             current_summaries = parent_summaries + [node.get('summary')]
-
         if not node.get('children'):
             node['context_summary'] = " > ".join(filter(None, current_summaries))
             node.pop('children', None)
@@ -123,7 +114,6 @@ def _flatten_tree_to_chunks(nodes, parent_summaries=None):
             final_chunks.append(node)
         else:
             final_chunks.extend(_flatten_tree_to_chunks(node['children'], current_summaries))
-            
     return final_chunks
 
 def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
@@ -135,11 +125,16 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
     preamble_nodes_flat = all_nodes[:first_book_index] if first_book_index != -1 else []
     main_content_nodes = all_nodes[first_book_index:] if first_book_index != -1 else all_nodes
 
+    # [!!! FIXED !!!] Ensure preamble nodes are structurally consistent.
+    # Add 'children' key to each preamble node so they are treated as proper leaf nodes.
+    for node in preamble_nodes_flat:
+        if 'children' not in node:
+            node['children'] = []
+
     structured_main_tree = _build_tree_from_flat_list(main_content_nodes)
     
     final_tree = []
     if preamble_nodes_flat:
-        # [!!! THE FIX !!!] Ensure the manually created node has the required keys.
         preamble_container = {
             "type": "preamble_container", 
             "title": "Preamble Section", 
@@ -157,19 +152,14 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
     for node in nodes_to_summarize:
         child_titles = [child.get('title', 'Untitled') for child in node.get('children', [])]
         child_titles_str = "\n".join(f"- {title}" for title in child_titles)
-
         prompt = PROMPT_HIERARCHICAL_SUMMARIZER.format(
             current_node_title=node.get('title', 'Untitled'),
             child_titles=child_titles_str
         )
-        
         try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME, messages=[{"role": "user", "content": prompt}]
-            )
+            response = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}])
             summary = response.choices[0].message.content.strip()
             node['summary'] = summary
-            
             llm_log["count"] += 1
             usage = response.usage
             call_log = {
@@ -185,9 +175,7 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
             llm_log["details"].append({"error": error_msg})
 
     debug_info.append({"pipeline_a_tree_with_summaries": final_tree})
-
     rag_chunks = _flatten_tree_to_chunks(final_tree)
-    
     return {"chunks": rag_chunks}
 
 def _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log):
@@ -196,13 +184,10 @@ def _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log):
         truncated_text = document_text[:MAX_CHARS_FOR_SUMMARY]
         if len(document_text) > MAX_CHARS_FOR_SUMMARY:
             debug_info.append({"warning": f"Document text was truncated to {MAX_CHARS_FOR_SUMMARY} chars."})
-
         summary_prompt = PROMPT_SUMMARIZER.format(text_chunk=truncated_text)
         response = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": summary_prompt}])
         summary = response.choices[0].message.content.strip()
-        
         llm_log["count"] += 1
-        usage = response.usage
         # ... logging ...
     except Exception as e:
         llm_log["details"].append({"error": f"Failed to summarize document: {e}"})
@@ -262,9 +247,7 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
             debug_info.append({"selected_pipeline": "B: Summary-Enriched Chunking"})
             final_result = _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log_container["llm_calls"])
     except Exception as e:
-        # Catch potential errors during pipeline execution
         return {"error": f"An error occurred in the selected pipeline: {e}", "traceback": traceback.format_exc()}
-
 
     end_time = time.perf_counter()
     timings["total_pipeline_duration"] = end_time - start_time
