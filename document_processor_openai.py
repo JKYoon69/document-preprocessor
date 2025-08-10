@@ -10,7 +10,7 @@ import time
 import re
 
 # ==============================================================================
-# [ CONFIGURATION ] - v14.0 Final Logic Fix for Summarization
+# [ CONFIGURATION ] - v14.1 KeyError Fix
 # ==============================================================================
 MODEL_NAME = "gpt-4.1-mini-2025-04-14"
 MAX_CHARS_FOR_SUMMARY = 64000
@@ -88,14 +88,11 @@ def _recursive_postprocess(nodes, full_document_text, parent_global_end):
         if node.get('children'):
             _recursive_postprocess(node['children'], full_document_text, node['global_end'])
 
-# [!!! NEW HELPER FUNCTION !!!]
-# Traverses the tree and returns a flat list of all nodes that have children.
 def _get_all_parent_nodes(nodes):
     parent_nodes = []
     
     def traverse(sub_nodes):
         for node in sub_nodes:
-            # Check if 'children' key exists and the list is not empty
             if node.get('children'):
                 parent_nodes.append(node)
                 traverse(node['children'])
@@ -103,8 +100,6 @@ def _get_all_parent_nodes(nodes):
     traverse(nodes)
     return parent_nodes
 
-# [!!! NEW HELPER FUNCTION !!!]
-# Flattens the tree and builds context for leaf nodes.
 def _flatten_tree_to_chunks(nodes, parent_summaries=None):
     if parent_summaries is None: parent_summaries = []
     
@@ -115,20 +110,17 @@ def _flatten_tree_to_chunks(nodes, parent_summaries=None):
             current_summaries = parent_summaries + [node.get('summary')]
 
         if not node.get('children'):
-            # This is a leaf node
             node['context_summary'] = " > ".join(filter(None, current_summaries))
             node.pop('children', None)
             node.pop('summary', None)
             final_chunks.append(node)
         else:
-            # This is a parent node, recurse
             final_chunks.extend(_flatten_tree_to_chunks(node['children'], current_summaries))
             
     return final_chunks
 
 
 def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
-    # 1. Parsing and Tree Building (Same as before)
     all_nodes = _parse_candidate_nodes(document_text)
     if not all_nodes: return {"error": "Deep Parsing Failed: No structural nodes found."}
     
@@ -141,18 +133,20 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
     
     final_tree = []
     if preamble_nodes_flat:
-        preamble_container = {"type": "preamble_container", "title": "Preamble Section", "children": preamble_nodes_flat}
+        preamble_container = {
+            "type": "preamble_container", 
+            "title": "Preamble Section", 
+            "global_start": 0,
+            "children": preamble_nodes_flat
+        }
         final_tree.append(preamble_container)
 
     final_tree.extend(structured_main_tree)
     
     _recursive_postprocess(final_tree, document_text, len(document_text))
 
-    # [!!! NEW SIMPLIFIED LOGIC !!!]
-    # 2. Get a simple list of all parent nodes that need summarization.
     nodes_to_summarize = _get_all_parent_nodes(final_tree)
     
-    # 3. Iterate through the simple list and summarize each one. No complex recursion.
     for node in nodes_to_summarize:
         child_titles = [child.get('title', 'Untitled') for child in node.get('children', [])]
         child_titles_str = "\n".join(f"- {title}" for title in child_titles)
@@ -168,9 +162,8 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
                 messages=[{"role": "user", "content": prompt}]
             )
             summary = response.choices[0].message.content.strip()
-            node['summary'] = summary # Attach summary directly to the node in the tree
+            node['summary'] = summary
             
-            # Logging
             llm_log["count"] += 1
             usage = response.usage
             call_log = {
@@ -188,13 +181,11 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
 
     debug_info.append({"pipeline_a_tree_with_summaries": final_tree})
 
-    # 4. Flatten the tree with populated summaries
     rag_chunks = _flatten_tree_to_chunks(final_tree)
     
     return {"chunks": rag_chunks}
 
 def _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log):
-    # This pipeline remains the same
     summary = "Summary generation failed."
     try:
         truncated_text = document_text[:MAX_CHARS_FOR_SUMMARY]
@@ -204,7 +195,18 @@ def _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log):
         summary_prompt = PROMPT_SUMMARIZER.format(text_chunk=truncated_text)
         response = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": summary_prompt}])
         summary = response.choices[0].message.content.strip()
-        # ... (LLM logging)
+        
+        llm_log["count"] += 1
+        usage = response.usage
+        call_log = {
+            "call_number": llm_log["count"],
+            "purpose": "Full Document Summary",
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens
+        }
+        llm_log["details"].append(call_log)
+
     except Exception as e:
         llm_log["details"].append({"error": f"Failed to summarize document: {e}"})
 
@@ -212,8 +214,17 @@ def _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log):
     article_nodes = [n for n in nodes if n.get('type') == 'article']
     
     if not article_nodes:
-        # ... (Fallback chunking logic)
-        return {}
+        chunks = document_text.split('\n\n')
+        final_chunks = []
+        current_pos = 0
+        for i, chunk_text in enumerate(chunks):
+            if not chunk_text.strip():
+                current_pos += len(chunk_text) + 2
+                continue
+            final_chunks.append({"type": "paragraph", "title": f"Paragraph {i+1}", "global_start": current_pos, "global_end": current_pos + len(chunk_text), "text": f"Document Summary: {summary}\n\n---\n\n{chunk_text}"})
+            current_pos += len(chunk_text) + 2
+        return {"chunks": final_chunks}
+
 
     enriched_chunks = []
     doc_len = len(document_text)
