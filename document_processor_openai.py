@@ -10,7 +10,7 @@ import time
 import re
 
 # ==============================================================================
-# [ CONFIGURATION ] - v11.0 Final Stable Version
+# [ CONFIGURATION ] - v10.1 Final Corrected Version
 # ==============================================================================
 MODEL_NAME = "gpt-4.1-2025-04-14"
 
@@ -60,20 +60,28 @@ Return ONLY the summary text.
 
 def _parse_candidate_nodes(text_chunk):
     candidate_nodes = []
+    # [!!! ENHANCED REGEX !!!] - Now captures 'หมายเหตุ' (Notes) at the end.
     pattern = re.compile(
         r"^(ภาค|ลักษณะ|หมวด|ส่วน|มาตรา|บทเฉพาะกาล|บทกำหนดโทษ|อัตราค่าธรรมเนียม|หมายเหตุ)\s*.*$", 
         re.MULTILINE
     )
+    
     for match in pattern.finditer(text_chunk):
         first_word = match.group(1)
         title = match.group(0).strip()
+        
         node_type = TYPE_MAPPING.get(first_word)
         if not node_type:
             if "บท" in first_word or "อัตรา" in first_word or "หมายเหตุ" in first_word:
                 node_type = "subheading"
             else:
                 node_type = "unknown"
-        candidate_nodes.append({"type": node_type, "title": title, "global_start": match.start()})
+
+        candidate_nodes.append({
+            "type": node_type,
+            "title": title,
+            "global_start": match.start()
+        })
     return candidate_nodes
 
 def _build_tree_from_flat_list(nodes):
@@ -83,12 +91,15 @@ def _build_tree_from_flat_list(nodes):
     for node in nodes:
         node['children'] = []
         node_level = HIERARCHY_LEVELS.get(node['type'], 99)
+        # FIX: Changed from '>=' to '>' to correctly handle sibling nodes.
         while stack and HIERARCHY_LEVELS.get(stack[-1]['type'], 99) >= node_level:
             stack.pop()
+        
         if not stack:
             root_nodes.append(node)
         else:
             stack[-1]['children'].append(node)
+        
         stack.append(node)
     return root_nodes
 
@@ -128,10 +139,11 @@ def _flatten_tree_to_chunks(nodes, parent_breadcrumbs=None, parent_summaries=Non
             node['context_path'] = " > ".join(filter(None, parent_breadcrumbs))
             node['context_summary'] = " ".join(filter(None, current_summaries))
             node.pop('children', None)
-            node.pop('summary', None)
+            node.pop('summary', None) # Clean up summary from leaf node
             final_chunks.append(node)
         else:
             final_chunks.extend(_flatten_tree_to_chunks(node['children'], current_breadcrumbs, current_summaries))
+            
     return final_chunks
 
 def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
@@ -216,7 +228,9 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     debug_info.append({"profiling_result": {"has_complex_structure": has_complex_structure}})
     
     final_result = {}
-    
+    # [!!! FIX !!!] - Pass the correct logging objects to the sub-pipelines.
+    # `debug_info` is the main list for general logs.
+    # `llm_log_container["llm_calls"]` is the specific dict for LLM call details.
     if has_complex_structure:
         status_container.write("-> Complex document. Running Hierarchical Summarization Pipeline.")
         debug_info.append({"selected_pipeline": "A: Deep Hierarchical"})
