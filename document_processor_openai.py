@@ -9,7 +9,7 @@ import time
 import re
 
 # ==============================================================================
-# [ CONFIGURATION ] - v7.1 Finalized
+# [ CONFIGURATION ] - v7.2 Final with Re-chunking for RAG
 # ==============================================================================
 MODEL_NAME = "gpt-4.1-2025-04-14"
 
@@ -65,8 +65,7 @@ def _parse_candidate_nodes(text_chunk):
     return candidate_nodes
 
 def _build_tree_from_flat_list(nodes):
-    if not nodes:
-        return []
+    if not nodes: return []
     root_nodes = []
     stack = []
     for node in nodes:
@@ -81,79 +80,97 @@ def _build_tree_from_flat_list(nodes):
         stack.append(node)
     return root_nodes
 
-# [!!! FINAL CORRECTED VERSION of _recursive_postprocess !!!]
 def _recursive_postprocess(nodes, full_document_text, parent_global_end):
-    """
-    Traverses the tree to calculate end indices and extract text from the FULL document.
-    """
     for i, node in enumerate(nodes):
-        # The end of the current node is the start of the next sibling, or the parent's end boundary
         next_sibling_start = nodes[i+1]['global_start'] if i + 1 < len(nodes) else parent_global_end
         node['global_end'] = next_sibling_start
-        
-        # FIX: Always slice from the original full_document_text using absolute global indices.
-        # This prevents empty text fields for nested children.
         node['text'] = full_document_text[node['global_start']:node['global_end']]
-
         if node.get('children'):
-            # FIX: Pass the current node's end as the explicit boundary for its children.
-            # This prevents the last child from over-extending its text content.
             _recursive_postprocess(node['children'], full_document_text, node['global_end'])
-    return nodes
+
+# [!!! NEW - Final Re-chunking for RAG !!!]
+def _flatten_tree_to_chunks(nodes, breadcrumbs=None):
+    """
+    Recursively traverses the tree and extracts final chunks for RAG.
+    A chunk is a node with no children or a node whose text is within the size limit.
+    """
+    if breadcrumbs is None: breadcrumbs = []
+    
+    final_chunks = []
+    for node in nodes:
+        current_breadcrumbs = breadcrumbs + [node.get('title', '')]
+        
+        is_leaf_node = not node.get('children')
+        
+        if is_leaf_node:
+            # This is a final chunk.
+            # Add breadcrumbs for context.
+            context_path = " > ".join(filter(None, current_breadcrumbs))
+            node['context_path'] = context_path
+            # We no longer need the children key for the final flat list
+            node.pop('children', None)
+            final_chunks.append(node)
+        else:
+            # This is a container node, recurse into its children
+            final_chunks.extend(_flatten_tree_to_chunks(node['children'], current_breadcrumbs))
+            
+    return final_chunks
+
 
 def _run_deep_hierarchical_pipeline(document_text, debug_info):
-    # 1. Parse all nodes deterministically
+    # 1. Parse all nodes
     all_nodes = _parse_candidate_nodes(document_text)
-    if not all_nodes:
-        return {"error": "Deep Parsing Failed: No structural nodes found."}
+    if not all_nodes: return {"error": "Deep Parsing Failed: No structural nodes found."}
     debug_info.append({"pipeline_a_parsed_nodes": all_nodes})
 
-    # 2. Build the tree using the stack algorithm
+    # 2. Build the full tree first
     tree = _build_tree_from_flat_list(all_nodes)
     
-    # 3. Finalize tree by adding a preamble and post-processing
+    # 3. Add preamble and post-process to get text and end indices
     final_tree = []
     if tree and tree[0].get('global_start', 0) > 0:
-        preamble = {"type": "preamble", "title": "Preamble", "global_start": 0, "children": []}
+        preamble_nodes = [n for n in all_nodes if n['global_start'] < tree[0]['global_start']]
+        preamble = {"type": "preamble", "title": "Preamble", "global_start": 0, "children": preamble_nodes}
         final_tree.append(preamble)
     final_tree.extend(tree)
     
-    processed_tree = _recursive_postprocess(final_tree, document_text, len(document_text))
-    return {"tree": processed_tree}
+    _recursive_postprocess(final_tree, document_text, len(document_text))
+    debug_info.append({"pipeline_a_full_hierarchical_tree": final_tree})
+
+    # 4. Flatten the tree into final, context-enriched chunks for RAG
+    rag_chunks = _flatten_tree_to_chunks(final_tree)
+    return {"chunks": rag_chunks}
+
 
 def _run_summary_chunking_pipeline(document_text, client, debug_info):
-    summary = "Summary generation failed." # Default value
+    summary = "Summary generation failed."
     try:
         summary_prompt = PROMPT_SUMMARIZER.format(text_chunk=document_text)
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": summary_prompt}]
-        )
+        response = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": summary_prompt}])
         summary = response.choices[0].message.content
         debug_info.append({"pipeline_b_summary": summary})
     except Exception as e:
         debug_info.append({"pipeline_b_summary_error": str(e)})
 
     nodes = _parse_candidate_nodes(document_text)
-    article_nodes = [n for n in nodes if n['type'] == 'article']
+    article_nodes = [n for n in nodes if n.get('type') == 'article']
     
     if not article_nodes:
-         # If no articles, chunk by paragraphs as a fallback
+        # Fallback to paragraph chunking if no articles found
         chunks = document_text.split('\n\n')
         final_chunks = []
         current_pos = 0
         for i, chunk_text in enumerate(chunks):
-            if not chunk_text.strip(): continue
+            if not chunk_text.strip():
+                current_pos += len(chunk_text) + 2
+                continue
             final_chunks.append({
-                "type": "paragraph",
-                "title": f"Paragraph {i+1}",
-                "global_start": current_pos,
-                "global_end": current_pos + len(chunk_text),
+                "type": "paragraph", "title": f"Paragraph {i+1}",
+                "global_start": current_pos, "global_end": current_pos + len(chunk_text),
                 "text": f"Document Summary: {summary}\n\n---\n\n{chunk_text}",
-                "children": []
             })
-            current_pos += len(chunk_text) + 2 # Add 2 for the newline characters
-        return {"tree": final_chunks}
+            current_pos += len(chunk_text) + 2
+        return {"chunks": final_chunks}
 
     enriched_chunks = []
     doc_len = len(document_text)
@@ -162,10 +179,10 @@ def _run_summary_chunking_pipeline(document_text, client, debug_info):
         node['global_end'] = next_node_start
         article_text = document_text[node['global_start']:node['global_end']]
         node['text'] = f"Document Summary: {summary}\n\n---\n\n{article_text}"
-        node['children'] = []
+        node.pop('children', None)
         enriched_chunks.append(node)
         
-    return {"tree": enriched_chunks}
+    return {"chunks": enriched_chunks}
 
 def run_openai_pipeline(document_text, api_key, status_container, debug_info, **kwargs):
     client = OpenAI(api_key=api_key)
@@ -176,11 +193,9 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     
     has_complex_structure = bool(re.search(r"^(ภาค|ลักษณะ)\s", document_text, re.MULTILINE))
     
-    profiling_result = { "has_complex_structure": has_complex_structure, "char_count": len(document_text) }
-    debug_info.append({"profiling_result": profiling_result})
+    debug_info.append({"profiling_result": {"has_complex_structure": has_complex_structure}})
     
     final_result = {}
-    
     if has_complex_structure:
         status_container.write("-> Complex document detected. Running Deep Hierarchical Pipeline.")
         debug_info.append({"selected_pipeline": "A: Deep Hierarchical"})
@@ -194,4 +209,8 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     timings["total_pipeline_duration"] = end_time - start_time
     debug_info.append({"performance_timings": timings})
     
+    # Standardize the final output key to 'tree' for the app.py
+    if "chunks" in final_result:
+        return {"tree": final_result["chunks"]}
+        
     return final_result
