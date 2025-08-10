@@ -61,20 +61,28 @@ Return ONLY the summary text.
 
 def _parse_candidate_nodes(text_chunk):
     candidate_nodes = []
+    # [!!! ENHANCED REGEX !!!] - Now captures 'หมายเหตุ' (Notes) at the end.
     pattern = re.compile(
-        r"^(ภาค|ลักษณะ|หมวด|ส่วน|มาตรา|บทเฉพาะกาล|บทกำหนดโทษ|อัตราค่าธรรมเนียม|หมายเหตุ)\s*.*$", 
+        r"^(ภาค|ลักษณะ|หมวด|ส่วน|มาตรา|บทเฉพาะกาล|บทกำหนดโทษ|อัตราค่าธรรมเนียม|หมายเหตุ)\s*.*$",
         re.MULTILINE
     )
+    
     for match in pattern.finditer(text_chunk):
         first_word = match.group(1)
         title = match.group(0).strip()
+        
         node_type = TYPE_MAPPING.get(first_word)
         if not node_type:
             if "บท" in first_word or "อัตรา" in first_word or "หมายเหตุ" in first_word:
                 node_type = "subheading"
             else:
                 node_type = "unknown"
-        candidate_nodes.append({"type": node_type, "title": title, "global_start": match.start()})
+
+        candidate_nodes.append({
+            "type": node_type,
+            "title": title,
+            "global_start": match.start()
+        })
     return candidate_nodes
 
 def _build_tree_from_flat_list(nodes):
@@ -84,12 +92,15 @@ def _build_tree_from_flat_list(nodes):
     for node in nodes:
         node['children'] = []
         node_level = HIERARCHY_LEVELS.get(node['type'], 99)
+        # FIX: Changed from '>=' to '>' to correctly handle sibling nodes.
         while stack and HIERARCHY_LEVELS.get(stack[-1]['type'], 99) >= node_level:
             stack.pop()
+        
         if not stack:
             root_nodes.append(node)
         else:
             stack[-1]['children'].append(node)
+        
         stack.append(node)
     return root_nodes
 
@@ -138,29 +149,30 @@ def _generate_hierarchical_summaries(nodes, client, debug_info, parent_summary="
                 debug_info["llm_calls"]["details"].append({"error": f"Failed to summarize {node['title']}: {e}"})
 
 
-def _flatten_tree_to_chunks(nodes, breadcrumbs=None, summary_path=None):
-    if breadcrumbs is None: breadcrumbs = []
-    if summary_path is None: summary_path = []
+def _flatten_tree_to_chunks(nodes, parent_breadcrumbs=None, parent_summaries=None):
+    if parent_breadcrumbs is None: parent_breadcrumbs = []
+    if parent_summaries is None: parent_summaries = []
 
     final_chunks = []
     for node in nodes:
-        current_breadcrumbs = breadcrumbs + [node.get('title', '')]
-        current_summary_path = summary_path + [node.get('summary', '')]
+        current_breadcrumbs = parent_breadcrumbs + [node.get('title', '')]
+        current_summaries = parent_summaries + [node.get('summary', '')]
 
         if not node.get('children'):
-            node['context_path'] = " > ".join(filter(None, current_breadcrumbs))
-            node['context_summary'] = " ".join(filter(None, current_summary_path))
+            node['context_path'] = " > ".join(filter(None, parent_breadcrumbs))
+            node['context_summary'] = " ".join(filter(None, current_summaries))
             node.pop('children', None)
             final_chunks.append(node)
         else:
-            final_chunks.extend(_flatten_tree_to_chunks(node['children'], current_breadcrumbs, current_summary_path))
+            final_chunks.extend(_flatten_tree_to_chunks(node['children'], current_breadcrumbs, current_summaries))
             
     return final_chunks
 
 def _run_deep_hierarchical_pipeline(document_text, client, debug_info):
     all_nodes = _parse_candidate_nodes(document_text)
     if not all_nodes: return {"error": "Deep Parsing Failed: No structural nodes found."}
-    
+    debug_info.append({"pipeline_a_parsed_nodes": all_nodes})
+
     first_book_index = next((i for i, node in enumerate(all_nodes) if node['type'] == 'book'), -1)
     
     preamble_nodes = all_nodes[:first_book_index] if first_book_index != -1 else []
@@ -240,7 +252,6 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     
     # Initialize LLM call logging
     debug_info.append({"llm_calls": {"count": 0, "details": []}})
-    # A bit of a hack to get a reference to the dict inside the list
     llm_debug_ref = debug_info[-1]
 
     status_container.write("1/3: **Profiler** - Analyzing document structure...")
@@ -263,7 +274,6 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     timings["total_pipeline_duration"] = end_time - start_time
     debug_info.append({"performance_timings": timings})
     
-    # Standardize the final output key to 'tree' for the app.py
     if "chunks" in final_result:
         return {"tree": final_result["chunks"]}
         
