@@ -1,5 +1,6 @@
 # document_processor_openai.py
-# This file contains the logic for processing documents using the Adaptive Parsing Strategy.
+# This file contains the logic for processing documents using the Adaptive Parsing Strategy
+# with Hierarchical Summarization and RAG-optimized chunking.
 
 import os
 from openai import OpenAI, APIError
@@ -9,7 +10,7 @@ import time
 import re
 
 # ==============================================================================
-# [ CONFIGURATION ] - v8.1 Finalized RAG-Optimized Output with Bug Fixes
+# [ CONFIGURATION ] - v10.0 Final Architecture
 # ==============================================================================
 MODEL_NAME = "gpt-4.1-2025-04-14"
 
@@ -27,6 +28,25 @@ TYPE_MAPPING = {
     "ส่วน": "section", "มาตรา": "article"
 }
 
+# Prompt for summarizing a node with its parent's context
+PROMPT_HIERARCHICAL_SUMMARIZER = """You are a Thai legal assistant. Your task is to create a concise, one-sentence summary for a specific section of a legal document.
+
+You will be given the parent section's summary for context, and the full text of the current section.
+
+-   **Parent Context**: This provides the broader legal context.
+-   **Current Section Text**: This is the text you need to summarize.
+
+Based on BOTH pieces of information, create a summary that explains the main purpose of the **Current Section Text** within the **Parent Context**.
+
+[Parent Context Summary]
+{parent_summary}
+
+[Current Section Text to Summarize]
+{text_chunk}
+
+Return ONLY the one-sentence summary of the Current Section Text.
+"""
+
 PROMPT_SUMMARIZER = """You are a legal assistant. Read the entire provided Thai legal document and generate a concise, one-paragraph summary. The summary should explain the main purpose and key subjects of the law or decree. Start the summary with "This document is about...".
 
 [DOCUMENT TEXT]
@@ -41,28 +61,20 @@ Return ONLY the summary text.
 
 def _parse_candidate_nodes(text_chunk):
     candidate_nodes = []
-    # [!!! ENHANCED REGEX !!!] - Now captures 'หมายเหตุ' (Notes) at the end.
     pattern = re.compile(
         r"^(ภาค|ลักษณะ|หมวด|ส่วน|มาตรา|บทเฉพาะกาล|บทกำหนดโทษ|อัตราค่าธรรมเนียม|หมายเหตุ)\s*.*$", 
         re.MULTILINE
     )
-    
     for match in pattern.finditer(text_chunk):
         first_word = match.group(1)
         title = match.group(0).strip()
-        
         node_type = TYPE_MAPPING.get(first_word)
         if not node_type:
             if "บท" in first_word or "อัตรา" in first_word or "หมายเหตุ" in first_word:
                 node_type = "subheading"
             else:
                 node_type = "unknown"
-
-        candidate_nodes.append({
-            "type": node_type,
-            "title": title,
-            "global_start": match.start()
-        })
+        candidate_nodes.append({"type": node_type, "title": title, "global_start": match.start()})
     return candidate_nodes
 
 def _build_tree_from_flat_list(nodes):
@@ -89,28 +101,66 @@ def _recursive_postprocess(nodes, full_document_text, parent_global_end):
         if node.get('children'):
             _recursive_postprocess(node['children'], full_document_text, node['global_end'])
 
-def _flatten_tree_to_chunks(nodes, parent_breadcrumbs=None):
-    if parent_breadcrumbs is None: parent_breadcrumbs = []
-    
+def _generate_hierarchical_summaries(nodes, client, debug_info, parent_summary="This document is a Thai legal code."):
+    """
+    Recursively generate summaries for container nodes, passing parent summary for context.
+    """
+    for node in nodes:
+        if node.get('children'): # Only summarize container nodes
+            prompt = PROMPT_HIERARCHICAL_SUMMARIZER.format(
+                parent_summary=parent_summary,
+                text_chunk=node['text']
+            )
+            try:
+                response = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                summary = response.choices[0].message.content
+                node['summary'] = summary
+
+                # Log LLM Call
+                usage = response.usage
+                debug_info["llm_calls"]["count"] += 1
+                call_log = {
+                    "call_number": debug_info["llm_calls"]["count"],
+                    "purpose": f"Summarize Node: {node['title'][:50]}...",
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens
+                }
+                debug_info["llm_calls"]["details"].append(call_log)
+                
+                # Recurse with the new summary as context for children
+                _generate_hierarchical_summaries(node['children'], client, debug_info, parent_summary=summary)
+            except Exception as e:
+                node['summary'] = "Summary generation failed."
+                debug_info["llm_calls"]["details"].append({"error": f"Failed to summarize {node['title']}: {e}"})
+
+
+def _flatten_tree_to_chunks(nodes, breadcrumbs=None, summary_path=None):
+    if breadcrumbs is None: breadcrumbs = []
+    if summary_path is None: summary_path = []
+
     final_chunks = []
     for node in nodes:
-        is_leaf_node = not node.get('children')
-        
-        if is_leaf_node:
-            node['context_path'] = " > ".join(filter(None, parent_breadcrumbs))
+        current_breadcrumbs = breadcrumbs + [node.get('title', '')]
+        current_summary_path = summary_path + [node.get('summary', '')]
+
+        if not node.get('children'):
+            node['context_path'] = " > ".join(filter(None, current_breadcrumbs))
+            node['context_summary'] = " ".join(filter(None, current_summary_path))
             node.pop('children', None)
             final_chunks.append(node)
         else:
-            current_breadcrumbs = parent_breadcrumbs + [node.get('title', '')]
-            final_chunks.extend(_flatten_tree_to_chunks(node['children'], current_breadcrumbs))
+            final_chunks.extend(_flatten_tree_to_chunks(node['children'], current_breadcrumbs, current_summary_path))
             
     return final_chunks
 
-def _run_deep_hierarchical_pipeline(document_text, debug_info):
+def _run_deep_hierarchical_pipeline(document_text, client, debug_info):
     all_nodes = _parse_candidate_nodes(document_text)
     if not all_nodes: return {"error": "Deep Parsing Failed: No structural nodes found."}
-    debug_info.append({"pipeline_a_parsed_nodes": all_nodes})
-
+    
     first_book_index = next((i for i, node in enumerate(all_nodes) if node['type'] == 'book'), -1)
     
     preamble_nodes = all_nodes[:first_book_index] if first_book_index != -1 else []
@@ -125,7 +175,9 @@ def _run_deep_hierarchical_pipeline(document_text, debug_info):
     final_tree.extend(structured_main_tree)
     
     _recursive_postprocess(final_tree, document_text, len(document_text))
-    debug_info.append({"pipeline_a_full_hierarchical_tree": final_tree})
+    
+    _generate_hierarchical_summaries(final_tree, client, debug_info)
+    debug_info.append({"pipeline_a_full_hierarchical_tree_with_summaries": final_tree})
 
     rag_chunks = _flatten_tree_to_chunks(final_tree)
     return {"chunks": rag_chunks}
@@ -136,9 +188,20 @@ def _run_summary_chunking_pipeline(document_text, client, debug_info):
         summary_prompt = PROMPT_SUMMARIZER.format(text_chunk=document_text)
         response = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": summary_prompt}])
         summary = response.choices[0].message.content
-        debug_info.append({"pipeline_b_summary": summary})
+        
+        usage = response.usage
+        debug_info["llm_calls"]["count"] += 1
+        call_log = {
+            "call_number": debug_info["llm_calls"]["count"],
+            "purpose": "Full Document Summary",
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens
+        }
+        debug_info["llm_calls"]["details"].append(call_log)
+        
     except Exception as e:
-        debug_info.append({"pipeline_b_summary_error": str(e)})
+        debug_info["llm_calls"]["details"].append({"error": f"Failed to summarize document: {e}"})
 
     nodes = _parse_candidate_nodes(document_text)
     article_nodes = [n for n in nodes if n.get('type') == 'article']
@@ -175,6 +238,11 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     client = OpenAI(api_key=api_key)
     timings = {}
     
+    # Initialize LLM call logging
+    debug_info.append({"llm_calls": {"count": 0, "details": []}})
+    # A bit of a hack to get a reference to the dict inside the list
+    llm_debug_ref = debug_info[-1]
+
     status_container.write("1/3: **Profiler** - Analyzing document structure...")
     start_time = time.perf_counter()
     
@@ -183,18 +251,19 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     
     final_result = {}
     if has_complex_structure:
-        status_container.write("-> Complex document detected. Running Deep Hierarchical Pipeline.")
+        status_container.write("-> Complex document. Running Hierarchical Summarization Pipeline.")
         debug_info.append({"selected_pipeline": "A: Deep Hierarchical"})
-        final_result = _run_deep_hierarchical_pipeline(document_text, debug_info)
+        final_result = _run_deep_hierarchical_pipeline(document_text, client, llm_debug_ref)
     else:
-        status_container.write("-> Simple document detected. Running Summary-Enriched Chunking Pipeline.")
+        status_container.write("-> Simple document. Running Summary-Enriched Chunking Pipeline.")
         debug_info.append({"selected_pipeline": "B: Summary-Enriched Chunking"})
-        final_result = _run_summary_chunking_pipeline(document_text, client, debug_info)
+        final_result = _run_summary_chunking_pipeline(document_text, client, llm_debug_ref)
 
     end_time = time.perf_counter()
     timings["total_pipeline_duration"] = end_time - start_time
     debug_info.append({"performance_timings": timings})
     
+    # Standardize the final output key to 'tree' for the app.py
     if "chunks" in final_result:
         return {"tree": final_result["chunks"]}
         
