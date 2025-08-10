@@ -128,7 +128,7 @@ def _flatten_tree_to_chunks(nodes, parent_breadcrumbs=None, parent_summaries=Non
             node['context_path'] = " > ".join(filter(None, parent_breadcrumbs))
             node['context_summary'] = " ".join(filter(None, current_summaries))
             node.pop('children', None)
-            node.pop('summary', None) # Clean up summary from leaf node
+            node.pop('summary', None)
             final_chunks.append(node)
         else:
             final_chunks.extend(_flatten_tree_to_chunks(node['children'], current_breadcrumbs, current_summaries))
@@ -202,10 +202,9 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     client = OpenAI(api_key=api_key)
     timings = {}
     
-    # [!!! FIX !!!] - Initialize the llm_log dict and append it to the list.
-    # Pass the dict itself to sub-functions, but append other logs to the main list.
-    llm_log = {"llm_calls": {"count": 0, "details": []}}
-    debug_info.append(llm_log)
+    # Correctly initialize and manage the debug logging
+    llm_log_container = {"llm_calls": {"count": 0, "details": []}}
+    debug_info.append(llm_log_container)
 
     status_container.write("1/3: **Profiler** - Analyzing document structure...")
     start_time = time.perf_counter()
@@ -214,14 +213,17 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     debug_info.append({"profiling_result": {"has_complex_structure": has_complex_structure}})
     
     final_result = {}
+    # [!!! FIX !!!] - Pass the correct logging objects to the sub-pipelines.
+    # `debug_info` is the main list for general logs.
+    # `llm_log_container["llm_calls"]` is the specific dict for LLM call details.
     if has_complex_structure:
         status_container.write("-> Complex document. Running Hierarchical Summarization Pipeline.")
         debug_info.append({"selected_pipeline": "A: Deep Hierarchical"})
-        final_result = _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log["llm_calls"])
+        final_result = _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log_container["llm_calls"])
     else:
         status_container.write("-> Simple document. Running Summary-Enriched Chunking Pipeline.")
         debug_info.append({"selected_pipeline": "B: Summary-Enriched Chunking"})
-        final_result = _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log["llm_calls"])
+        final_result = _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log_container["llm_calls"])
 
     end_time = time.perf_counter()
     timings["total_pipeline_duration"] = end_time - start_time
