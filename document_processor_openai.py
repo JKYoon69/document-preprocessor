@@ -10,7 +10,7 @@ import time
 import re
 
 # ==============================================================================
-# [ CONFIGURATION ] - v10.1 Final Corrected Version
+# [ CONFIGURATION ] - v11.0 Final Stable Version
 # ==============================================================================
 MODEL_NAME = "gpt-4.1-2025-04-14"
 
@@ -153,7 +153,10 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
     final_tree.extend(structured_main_tree)
     
     _recursive_postprocess(final_tree, document_text, len(document_text))
+    
+    # [!!! RE-ADDED THE MISSING LLM CALL !!!]
     _generate_hierarchical_summaries(final_tree, client, llm_log)
+    
     debug_info.append({"pipeline_a_full_hierarchical_tree_with_summaries": final_tree})
 
     rag_chunks = _flatten_tree_to_chunks(final_tree)
@@ -213,9 +216,7 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     debug_info.append({"profiling_result": {"has_complex_structure": has_complex_structure}})
     
     final_result = {}
-    # [!!! FIX !!!] - Pass the correct logging objects to the sub-pipelines.
-    # `debug_info` is the main list for general logs.
-    # `llm_log_container["llm_calls"]` is the specific dict for LLM call details.
+    
     if has_complex_structure:
         status_container.write("-> Complex document. Running Hierarchical Summarization Pipeline.")
         debug_info.append({"selected_pipeline": "A: Deep Hierarchical"})
