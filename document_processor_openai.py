@@ -9,7 +9,7 @@ import time
 import re
 
 # ==============================================================================
-# [ CONFIGURATION ] - v7.2 Final with Re-chunking for RAG
+# [ CONFIGURATION ] - v8.0 Finalized RAG-Optimized Output
 # ==============================================================================
 MODEL_NAME = "gpt-4.1-2025-04-14"
 
@@ -88,34 +88,26 @@ def _recursive_postprocess(nodes, full_document_text, parent_global_end):
         if node.get('children'):
             _recursive_postprocess(node['children'], full_document_text, node['global_end'])
 
-# [!!! NEW - Final Re-chunking for RAG !!!]
 def _flatten_tree_to_chunks(nodes, breadcrumbs=None):
-    """
-    Recursively traverses the tree and extracts final chunks for RAG.
-    A chunk is a node with no children or a node whose text is within the size limit.
-    """
     if breadcrumbs is None: breadcrumbs = []
     
     final_chunks = []
     for node in nodes:
-        current_breadcrumbs = breadcrumbs + [node.get('title', '')]
+        # Don't include the node's own title in the breadcrumb path for itself
+        parent_breadcrumbs = breadcrumbs 
         
         is_leaf_node = not node.get('children')
         
         if is_leaf_node:
-            # This is a final chunk.
-            # Add breadcrumbs for context.
-            context_path = " > ".join(filter(None, current_breadcrumbs))
-            node['context_path'] = context_path
-            # We no longer need the children key for the final flat list
+            node['context_path'] = " > ".join(filter(None, parent_breadcrumbs))
             node.pop('children', None)
             final_chunks.append(node)
         else:
-            # This is a container node, recurse into its children
+            # For recursion, add the current node's title to the breadcrumbs for its children
+            current_breadcrumbs = parent_breadcrumbs + [node.get('title', '')]
             final_chunks.extend(_flatten_tree_to_chunks(node['children'], current_breadcrumbs))
             
     return final_chunks
-
 
 def _run_deep_hierarchical_pipeline(document_text, debug_info):
     # 1. Parse all nodes
@@ -123,21 +115,27 @@ def _run_deep_hierarchical_pipeline(document_text, debug_info):
     if not all_nodes: return {"error": "Deep Parsing Failed: No structural nodes found."}
     debug_info.append({"pipeline_a_parsed_nodes": all_nodes})
 
-    # 2. Build the full tree first
-    tree = _build_tree_from_flat_list(all_nodes)
+    # 2. Separate Preamble nodes from Main Content nodes BEFORE building the tree
+    first_book_index = next((i for i, node in enumerate(all_nodes) if node['type'] == 'book'), -1)
     
-    # 3. Add preamble and post-process to get text and end indices
+    preamble_nodes = all_nodes[:first_book_index] if first_book_index != -1 else []
+    main_content_nodes = all_nodes[first_book_index:] if first_book_index != -1 else all_nodes
+
+    # 3. Build the tree for the main content only
+    structured_main_tree = _build_tree_from_flat_list(main_content_nodes)
+    
+    # 4. Create a final, clean tree structure
     final_tree = []
-    if tree and tree[0].get('global_start', 0) > 0:
-        preamble_nodes = [n for n in all_nodes if n['global_start'] < tree[0]['global_start']]
-        preamble = {"type": "preamble", "title": "Preamble", "global_start": 0, "children": preamble_nodes}
-        final_tree.append(preamble)
-    final_tree.extend(tree)
+    if preamble_nodes:
+        preamble_container = {"type": "preamble", "title": "Preamble", "global_start": 0, "children": preamble_nodes}
+        final_tree.append(preamble_container)
+    final_tree.extend(structured_main_tree)
     
+    # 5. Post-process the clean tree to add text and end indices
     _recursive_postprocess(final_tree, document_text, len(document_text))
     debug_info.append({"pipeline_a_full_hierarchical_tree": final_tree})
 
-    # 4. Flatten the tree into final, context-enriched chunks for RAG
+    # 6. Flatten the fully processed tree into final, context-enriched chunks for RAG
     rag_chunks = _flatten_tree_to_chunks(final_tree)
     return {"chunks": rag_chunks}
 
@@ -156,7 +154,6 @@ def _run_summary_chunking_pipeline(document_text, client, debug_info):
     article_nodes = [n for n in nodes if n.get('type') == 'article']
     
     if not article_nodes:
-        # Fallback to paragraph chunking if no articles found
         chunks = document_text.split('\n\n')
         final_chunks = []
         current_pos = 0
@@ -192,7 +189,6 @@ def run_openai_pipeline(document_text, api_key, status_container, debug_info, **
     start_time = time.perf_counter()
     
     has_complex_structure = bool(re.search(r"^(ภาค|ลักษณะ)\s", document_text, re.MULTILINE))
-    
     debug_info.append({"profiling_result": {"has_complex_structure": has_complex_structure}})
     
     final_result = {}
