@@ -10,7 +10,7 @@ import time
 import re
 
 # ==============================================================================
-# [ CONFIGURATION ] - v17.0 Final Simplified Logic
+# [ CONFIGURATION ] - v17.1 Final Fix for IndentationError
 # ==============================================================================
 MODEL_NAME = "gpt-4.1-mini-2025-04-14"
 MAX_CHARS_FOR_SUMMARY = 64000
@@ -117,34 +117,23 @@ def _flatten_tree_to_chunks(nodes, parent_summaries=None):
     return final_chunks
 
 def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
-    # [!!! NEW SIMPLIFIED LOGIC !!!]
-    
-    # 1. Parse all structural nodes first.
     all_nodes = _parse_candidate_nodes(document_text)
     if not all_nodes:
         return {"chunks": [{"type": "full_document", "title": "Full Document", "global_start": 0, "global_end": len(document_text), "text": document_text}]}
 
-    # 2. Check if there is text BEFORE the first structural node.
     if all_nodes[0]['global_start'] > 0:
         declaration_node = {
-            'type': 'declaration',
-            'title': 'Document Declaration',
-            'global_start': 0,
-            'children': [] 
+            'type': 'declaration', 'title': 'Document Declaration',
+            'global_start': 0, 'children': []
         }
-        # Insert this new node at the very beginning of the list.
         all_nodes.insert(0, declaration_node)
 
-    # 3. Build ONE tree from the ENTIRE list of nodes. No more separation.
     final_tree = _build_tree_from_flat_list(all_nodes)
-    
-    # 4. Post-process the entire tree to get text content for each node.
     _recursive_postprocess(final_tree, document_text, len(document_text))
 
-    # 5. Summarize parent nodes (same as before).
     nodes_to_summarize = _get_all_parent_nodes(final_tree)
     for node in nodes_to_summarize:
-        if not node.get('children'): continue # Should not happen, but as a safeguard
+        if not node.get('children'): continue
         
         child_titles = [child.get('title', 'Untitled') for child in node.get('children')]
         child_titles_str = "\n".join(f"- {title}" for title in child_titles)
@@ -169,22 +158,66 @@ def _run_deep_hierarchical_pipeline(document_text, client, debug_info, llm_log):
             llm_log["details"].append({"error": error_msg})
 
     debug_info.append({"pipeline_a_tree_with_summaries": final_tree})
-
-    # 6. Flatten the final tree into chunks.
     rag_chunks = _flatten_tree_to_chunks(final_tree)
     return {"chunks": rag_chunks}
 
-
+# [!!! FIXED !!!] Restored the full implementation for this function.
 def _run_summary_chunking_pipeline(document_text, client, debug_info, llm_log):
     summary = "Summary generation failed."
     try:
-        # ... implementation for simple documents ...
+        truncated_text = document_text[:MAX_CHARS_FOR_SUMMARY]
+        if len(document_text) > MAX_CHARS_FOR_SUMMARY:
+            debug_info.append({"warning": f"Document text was truncated to {MAX_CHARS_FOR_SUMMARY} chars for summary."})
+
+        summary_prompt = PROMPT_SUMMARIZER.format(text_chunk=truncated_text)
+        response = client.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": summary_prompt}])
+        summary = response.choices[0].message.content.strip()
+        llm_log["count"] += 1
+        usage = response.usage
+        call_log = {
+            "call_number": llm_log["count"], "purpose": "Full Document Summary",
+            "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens
+        }
+        llm_log["details"].append(call_log)
     except Exception as e:
         llm_log["details"].append({"error": f"Failed to summarize document: {e}"})
 
-    # ... implementation ...
+    nodes = _parse_candidate_nodes(document_text)
+    
+    if not nodes or (nodes and nodes[0]['global_start'] > 0):
+        end_pos = nodes[0]['global_start'] if nodes else len(document_text)
+        declaration_node = {
+            'type': 'declaration', 'title': 'Document Declaration',
+            'global_start': 0, 'global_end': end_pos,
+            'text': document_text[0:end_pos]
+        }
+        if nodes:
+            nodes.insert(0, declaration_node)
+        else:
+            nodes.append(declaration_node)
+
+    article_nodes = [n for n in nodes if n.get('type') in ['article', 'declaration', 'subheading']]
+    
+    if not article_nodes:
+        return {"chunks": []}
+
+    enriched_chunks = []
+    doc_len = len(document_text)
+    for i, node in enumerate(article_nodes):
+        if 'global_end' not in node:
+            next_node_start = article_nodes[i+1]['global_start'] if i + 1 < len(article_nodes) else doc_len
+            node['global_end'] = next_node_start
         
-    return {"chunks": []} # Placeholder
+        if 'text' not in node:
+            node['text'] = document_text[node['global_start']:node['global_end']]
+
+        # Prepend the summary to all chunks
+        node['text'] = f"Document Summary: {summary}\n\n---\n\n{node['text']}"
+        node.pop('children', None)
+        enriched_chunks.append(node)
+        
+    return {"chunks": enriched_chunks}
 
 def run_openai_pipeline(document_text, api_key, status_container, debug_info, **kwargs):
     client = OpenAI(api_key=api_key)
